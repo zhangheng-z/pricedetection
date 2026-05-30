@@ -32,24 +32,24 @@ anti_risk:
   randomize_viewport: false
 
   # Wait after search results load, before/around sorting.
-  search_delay_seconds: [1, 2]
+  search_delay_seconds: [0, 0]
   # Wait after clicking "price low to high".
-  sort_delay_seconds: [1, 2]
+  sort_delay_seconds: [0, 0]
   # Wait before and after result page turns.
-  page_turn_delay_seconds: [1, 3]
+  page_turn_delay_seconds: [0, 0]
   # Wait between individual list items while filtering.
-  per_item_delay_seconds: [1, 2]
+  per_item_delay_seconds: [0, 0]
   # Wait before entering a product detail page.
-  detail_click_delay_seconds: [1, 3]
+  detail_click_delay_seconds: [0, 0]
   # Wait before clicking buy on the detail page.
-  buy_click_delay_seconds: [1, 3]
+  buy_click_delay_seconds: [0, 0]
   # Cool down after returning from a detail/order check.
-  post_detail_cooldown_seconds: [1, 3]
+  post_detail_cooldown_seconds: [0, 0]
 
   # Conservative defaults reduce order-page visits, which are the riskiest action.
-  max_pages_per_keyword: 3
-  max_detail_clicks_per_keyword: 30
-  max_detail_clicks_per_run: 60
+  max_pages_per_keyword: 30
+  max_detail_clicks_per_keyword: 600
+  max_detail_clicks_per_run: 600
 
   # Prefer current-tab navigation over repeatedly opening new tabs.
   open_detail_in_new_page: false

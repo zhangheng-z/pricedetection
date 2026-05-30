@@ -120,7 +120,7 @@ class BaseAgent:
         alerts_created = 0
 
         try:
-            selected_keywords = [random.choice(keywords)]
+            selected_keywords = self._select_keywords(keywords)
             print(f"[{self.PLATFORM}] selected keywords: {selected_keywords}", flush=True)
             for keyword_index, keyword in enumerate(selected_keywords, start=1):
                 print(
@@ -131,6 +131,10 @@ class BaseAgent:
                 page_index = 1
                 configured_max_pages = self._anti_risk_int("max_pages_per_keyword", 50)
                 max_pages = configured_max_pages if configured_max_pages > 0 else 9999
+                actual_total_pages = await self._get_total_results_pages(page)
+                if actual_total_pages > 0:
+                    max_pages = min(max_pages, actual_total_pages)
+                    print(f"[{self.PLATFORM}] total results pages: {actual_total_pages}, scan pages: {max_pages}", flush=True)
                 while page_index <= max_pages:
                     print(f"[{self.PLATFORM}] extracting listings page {page_index}...", flush=True)
                     raw_items = await asyncio.wait_for(
@@ -201,7 +205,14 @@ class BaseAgent:
                 self.title_filtered_count += 1
                 continue
 
-            if list_price in {3.9, 9.9, 39.9, 2498.0, 2198.0}:
+            if self._should_skip_cn_year_trial_mix(title, keyword, list_price):
+                print(
+                    f"[{self.PLATFORM}] skip detail: cn year search trial mix price {list_price} <= 100",
+                    flush=True,
+                )
+                continue
+
+            if list_price in {9.9, 39.9, 2498.0, 2198.0}:
                 print(
                     f"[{self.PLATFORM}] skip detail: ignored list price {list_price}",
                     flush=True,
@@ -263,19 +274,27 @@ class BaseAgent:
             listing.id = listing_id
             listings_found += 1
 
-            if listing.price > 0 and self.price_judge.is_below_official(
-                listing.price, self.product.official_price
-            ):
+            analysis = self.price_judge.analyze_listing(
+                title=listing.title,
+                price=listing.price,
+                product_name=self.product.name,
+                official_price=self.product.official_price,
+                spec_text=order_offer.get("spec_text", ""),
+            )
+            if order_offer.get("force_decision") == "DELIST":
+                analysis["decision"] = "DELIST"
+                analysis["risk_level"] = "HIGH"
+                analysis["price_judgement_type"] = "DELIST_REQUIRED"
+                analysis["reason"] = "\u53ef\u552e\u89c4\u683c\u547d\u4e2d\u9002\u8da3AI\u4e2d\u65877\u5929\uff0c\u9700\u4e0b\u67b6"
+            decision = str(analysis.get("decision", "UNKNOWN"))
+
+            if decision in {"VIOLATION", "SUSPECTED", "REVIEW", "DELIST"}:
                 print(
-                    f"[{self.PLATFORM}] price alert candidate: {listing.price} < {self.product.official_price}",
+                    f"[{self.PLATFORM}] price alert candidate: {decision} "
+                    f"(price={listing.price}, official={self.product.official_price})",
                     flush=True,
                 )
-                judgment = await self.price_judge.llm_confirm_violation(
-                    title=listing.title,
-                    price=listing.price,
-                    product_name=self.product.name,
-                    official_price=self.product.official_price,
-                )
+                setattr(listing, "judgment", decision)
                 alert = PriceAlert(
                     listing_id=listing_id,
                     platform=self.PLATFORM,
@@ -283,8 +302,8 @@ class BaseAgent:
                     title=listing.title,
                     price=listing.price,
                     official_price=self.product.official_price,
-                    judgment=judgment.get("judgment", "violation"),
-                    reason=judgment.get("reason", ""),
+                    judgment=decision,
+                    reason=self.price_judge.format_analysis_reason(analysis),
                 )
                 self.db.save_alert(alert)
                 self.collected_listings.append(listing)
@@ -292,8 +311,24 @@ class BaseAgent:
 
         return listings_found, alerts_created
 
+    def _select_keywords(self, keywords: List[str]) -> List[str]:
+        return [random.choice(keywords)]
+
+    def _should_skip_cn_year_trial_mix(self, title: str, keyword: str, list_price: float) -> bool:
+        search_text = self._normalize_title(f"{self.product.name}{keyword}")
+        title_text = self._normalize_title(title)
+        return (
+            list_price <= 100
+            and "\u4e2d\u6587" in search_text
+            and self._has_year_card(search_text)
+            and (self._has_duration(title_text, 15) or self._has_duration(title_text, 21))
+        )
+
     async def _goto_next_results_page(self, page: Page) -> bool:
         return False
+
+    async def _get_total_results_pages(self, page: Page) -> int:
+        return 0
 
     async def _fetch_order_offer(
         self,
@@ -525,7 +560,12 @@ class BaseAgent:
                 deduped[key] = listing
 
         rows = [
-            {"title": listing.title, "price": listing.price, "url": listing.url}
+            {
+                "title": listing.title,
+                "price": listing.price,
+                "url": listing.url,
+                "judgment": getattr(listing, "judgment", ""),
+            }
             for listing in deduped.values()
         ]
         save_listing_table(rows, path)

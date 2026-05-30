@@ -73,7 +73,12 @@ async def run_agent_for_product(
         "results_file": str(agent.last_results_path) if agent.last_results_path else "",
         "raw_results_file": str(agent.last_raw_results_path) if agent.last_raw_results_path else "",
         "items": [
-            {"title": item.title, "price": item.price, "url": item.url}
+            {
+                "title": item.title,
+                "price": item.price,
+                "url": item.url,
+                "judgment": getattr(item, "judgment", ""),
+            }
             for item in agent.collected_listings
         ],
     }
@@ -94,6 +99,7 @@ def save_deduped_run_results(run_results: List[dict]) -> str:
                 "title": item.get("title", ""),
                 "price": item.get("price", 0),
                 "url": url,
+                "judgment": item.get("judgment", ""),
             })
 
     items.sort(key=lambda row: (float(row.get("price") or 0) <= 0, float(row.get("price") or 0)))

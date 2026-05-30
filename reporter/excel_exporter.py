@@ -15,12 +15,16 @@ def shorten_text(text: str, max_len: int = 42) -> str:
 
 def save_listing_table(rows: Iterable[Mapping], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    rows = list(rows)
+    include_judgment = any(row.get("judgment") for row in rows)
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "搜索结果"
+    ws.title = "\u641c\u7d22\u7ed3\u679c"
 
-    headers = ["序号", "标题", "价格", "商品链接", "完整标题"]
+    headers = ["\u5e8f\u53f7", "\u6807\u9898", "\u4ef7\u683c", "\u5546\u54c1\u94fe\u63a5", "\u5b8c\u6574\u6807\u9898"]
+    if include_judgment:
+        headers.append("\u5224\u5b9a\u7ed3\u679c")
     ws.append(headers)
 
     sorted_rows = sorted(
@@ -30,15 +34,27 @@ def save_listing_table(rows: Iterable[Mapping], path: Path) -> Path:
     if sorted_rows:
         for index, row in enumerate(sorted_rows, start=1):
             title = str(row.get("title", ""))
-            ws.append([
+            values = [
                 index,
                 shorten_text(title),
                 row.get("price", ""),
                 row.get("url", ""),
                 title,
-            ])
+            ]
+            if include_judgment:
+                values.append(row.get("judgment", ""))
+            ws.append(values)
     else:
-        ws.append([1, "无匹配商品", "", "", "本次搜索未采集到符合标题规则的商品"])
+        values = [
+            1,
+            "\u65e0\u5339\u914d\u5546\u54c1",
+            "",
+            "",
+            "\u672c\u6b21\u641c\u7d22\u672a\u91c7\u96c6\u5230\u7b26\u5408\u6807\u9898\u89c4\u5219\u7684\u5546\u54c1",
+        ]
+        if include_judgment:
+            values.append("")
+        ws.append(values)
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
@@ -54,6 +70,8 @@ def save_listing_table(rows: Iterable[Mapping], path: Path) -> Path:
         "D": 64,
         "E": 80,
     }
+    if include_judgment:
+        widths["F"] = 16
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
 
@@ -63,12 +81,14 @@ def save_listing_table(rows: Iterable[Mapping], path: Path) -> Path:
         row[2].alignment = Alignment(horizontal="right", vertical="top")
         row[3].alignment = Alignment(wrap_text=True, vertical="top")
         row[4].alignment = Alignment(wrap_text=True, vertical="top")
+        if include_judgment and len(row) >= 6:
+            row[5].alignment = Alignment(horizontal="center", vertical="top")
 
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
 
     if ws.max_row >= 2:
-        table_ref = f"A1:E{ws.max_row}"
+        table_ref = f"A1:{'F' if include_judgment else 'E'}{ws.max_row}"
         table = Table(displayName="SearchResults", ref=table_ref)
         table.tableStyleInfo = TableStyleInfo(
             name="TableStyleMedium2",

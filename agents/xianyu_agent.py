@@ -86,15 +86,17 @@ class XianyuAgent(BaseAgent):
                 """
                 () => ({
                     firstUrl: document.querySelector('a[class*="feeds-item-wrap"]')?.href || '',
-                    activePage: Array.from(document.querySelectorAll('[class*="pagination"] [class*="page-box"]'))
+                    activePage: Array.from(document.querySelectorAll('[class*="pagination-page-box"]'))
                         .find((el) => /active/.test(el.className || ''))?.textContent?.trim() || '',
+                    tinyPage: Array.from(document.querySelectorAll('[class*="search-page-tiny-page"]'))
+                        .find((el) => (el.textContent || '').includes('/'))?.textContent?.trim() || '',
+                    url: location.href,
                 })
                 """
             )
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await self._anti_risk_delay("page_turn_delay_seconds", "before next page")
 
-            clicked = await page.evaluate(
+            target = await page.evaluate(
                 """
                 () => {
                     const visible = (el) => {
@@ -103,34 +105,74 @@ class XianyuAgent(BaseAgent):
                         return rect.width > 0 && rect.height > 0 &&
                             style.visibility !== 'hidden' && style.display !== 'none';
                     };
+                    const tinyButton = Array.from(document.querySelectorAll('button'))
+                        .find((el) => visible(el) && !el.disabled && el.querySelector('[class*="search-page-tiny-arrow-right"]'));
+                    if (tinyButton) {
+                        tinyButton.scrollIntoView({block: 'center', inline: 'center'});
+                        const rect = tinyButton.getBoundingClientRect();
+                        return {
+                            x: rect.left + rect.width / 2,
+                            y: rect.top + rect.height / 2,
+                            label: 'tiny-next',
+                        };
+                    }
+
+                    window.scrollTo(0, document.body.scrollHeight);
                     const container = Array.from(document.querySelectorAll('[class*="pagination"]'))
                         .filter(visible)
                         .pop();
-                    if (!container) return false;
+                    if (!container) return null;
 
-                    const pageBoxes = Array.from(container.querySelectorAll('[class*="page-box"]'))
+                    const pageBoxes = Array.from(container.querySelectorAll('[class*="pagination-page-box"]'))
                         .filter((el) => visible(el) && /^\\d+$/.test((el.textContent || '').trim()));
                     const activeIndex = pageBoxes.findIndex((el) => /active/.test(el.className || ''));
                     if (activeIndex >= 0 && activeIndex + 1 < pageBoxes.length) {
                         const nextPage = pageBoxes[activeIndex + 1];
                         nextPage.scrollIntoView({block: 'center', inline: 'center'});
-                        nextPage.click();
-                        return true;
+                        const rect = nextPage.getBoundingClientRect();
+                        return {
+                            x: rect.left + rect.width / 2,
+                            y: rect.top + rect.height / 2,
+                            label: (nextPage.textContent || '').trim(),
+                        };
                     }
 
                     const button = Array.from(container.querySelectorAll('button'))
                         .find((el) => visible(el) && !el.disabled && el.querySelector('[class*="arrow-right"]'));
-                    if (!button) return false;
+                    if (!button) return null;
                     button.scrollIntoView({block: 'center', inline: 'center'});
-                    button.click();
-                    return true;
+                    const rect = button.getBoundingClientRect();
+                    return {
+                        x: rect.left + rect.width / 2,
+                        y: rect.top + rect.height / 2,
+                        label: 'next',
+                    };
                 }
                 """
             )
-            if not clicked:
+            if not target:
                 return False
+            await page.mouse.move(target["x"], target["y"])
+            await page.mouse.click(target["x"], target["y"])
 
             try:
+                await page.wait_for_function(
+                    """
+                    (state) => {
+                        const firstUrl = document.querySelector('a[class*="feeds-item-wrap"]')?.href || '';
+                        const activePage = Array.from(document.querySelectorAll('[class*="pagination-page-box"]'))
+                            .find((el) => /active/.test(el.className || ''))?.textContent?.trim() || '';
+                        const tinyPage = Array.from(document.querySelectorAll('[class*="search-page-tiny-page"]'))
+                            .find((el) => (el.textContent || '').includes('/'))?.textContent?.trim() || '';
+                        return location.href !== state.url ||
+                            (firstUrl && firstUrl !== state.firstUrl) ||
+                            (activePage && activePage !== state.activePage) ||
+                            (tinyPage && tinyPage !== state.tinyPage);
+                    }
+                    """,
+                    current_state,
+                    timeout=15000,
+                )
                 await page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
                 pass
@@ -141,17 +183,71 @@ class XianyuAgent(BaseAgent):
                 """
                 () => ({
                     firstUrl: document.querySelector('a[class*="feeds-item-wrap"]')?.href || '',
-                    activePage: Array.from(document.querySelectorAll('[class*="pagination"] [class*="page-box"]'))
+                    activePage: Array.from(document.querySelectorAll('[class*="pagination-page-box"]'))
                         .find((el) => /active/.test(el.className || ''))?.textContent?.trim() || '',
+                    tinyPage: Array.from(document.querySelectorAll('[class*="search-page-tiny-page"]'))
+                        .find((el) => (el.textContent || '').includes('/'))?.textContent?.trim() || '',
+                    url: location.href,
                 })
                 """
             )
             return bool(
-                next_state.get("firstUrl")
-                and (
-                    next_state.get("firstUrl") != current_state.get("firstUrl")
-                    or next_state.get("activePage") != current_state.get("activePage")
+                next_state.get("url") != current_state.get("url")
+                or (
+                    next_state.get("firstUrl")
+                    and next_state.get("firstUrl") != current_state.get("firstUrl")
                 )
+                or (
+                    next_state.get("activePage")
+                    and next_state.get("activePage") != current_state.get("activePage")
+                )
+                or (
+                    next_state.get("tinyPage")
+                    and next_state.get("tinyPage") != current_state.get("tinyPage")
+                )
+            )
+        except Exception:
+            return False
+
+    async def _get_total_results_pages(self, page: Page) -> int:
+        try:
+            value = await page.evaluate(
+                """
+                () => {
+                    const tinyText = Array.from(document.querySelectorAll('[class*="search-page-tiny-page"]'))
+                        .map((el) => (el.textContent || '').trim())
+                        .find((text) => /^\\d+\\s*\\/\\s*\\d+$/.test(text));
+                    if (tinyText) {
+                        const match = tinyText.match(/\\/\\s*(\\d+)/);
+                        if (match) return Number.parseInt(match[1], 10) || 0;
+                    }
+
+                    const pageNumbers = Array.from(document.querySelectorAll('[class*="pagination-page-box"]'))
+                        .map((el) => Number.parseInt((el.textContent || '').trim(), 10))
+                        .filter((value) => Number.isFinite(value) && value > 0);
+                    return pageNumbers.length ? Math.max(...pageNumbers) : 0;
+                }
+                """
+            )
+            return int(value or 0)
+        except Exception:
+            return 0
+
+    async def _ensure_price_asc_sort(self, page: Page) -> bool:
+        if await self._is_price_asc_sort_selected(page):
+            return True
+        sorted_ok = await self._click_price_asc_sort(page)
+        if sorted_ok:
+            print(f"[{self.PLATFORM}] price ascending sort restored", flush=True)
+        return sorted_ok
+
+    async def _is_price_asc_sort_selected(self, page: Page) -> bool:
+        try:
+            return await page.evaluate(
+                """
+                () => Array.from(document.querySelectorAll('[class*="search-select-container"]'))
+                    .some((el) => (el.innerText || el.textContent || '').replace(/\\s+/g, '').includes('\u4ef7\u683c\u4ece\u4f4e\u5230\u9ad8'))
+                """
             )
         except Exception:
             return False
@@ -262,9 +358,7 @@ class XianyuAgent(BaseAgent):
         if not url:
             return None
 
-        use_new_page = bool(getattr(self.anti_risk, "open_detail_in_new_page", False))
-        search_url = source_page.url
-        detail_page = await source_page.context.new_page() if use_new_page else source_page
+        detail_page = await source_page.context.new_page()
         try:
             await detail_page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await AntiDetect.random_delay(1, 2)
@@ -288,14 +382,7 @@ class XianyuAgent(BaseAgent):
             print(f"[{self.PLATFORM}] failed to fetch order price: {exc}", flush=True)
             return None
         finally:
-            if use_new_page:
-                await detail_page.close()
-            elif search_url and search_url != detail_page.url:
-                try:
-                    await detail_page.goto(search_url, wait_until="networkidle", timeout=30000)
-                    await AntiDetect.random_delay(2, 4)
-                except Exception:
-                    pass
+            await detail_page.close()
 
     async def _click_buy_now(self, page: Page) -> bool:
         labels = [
@@ -328,15 +415,54 @@ class XianyuAgent(BaseAgent):
         spec_state = await self._collect_xianyu_order_options(page, intent)
         candidates = spec_state.get("candidates", [])
 
+        delist_candidate = next(
+            (candidate for candidate in spec_state.get("options", []) if "7d" in candidate.get("kinds", [])),
+            None,
+        )
+        if delist_candidate:
+            price = delist_candidate.get("option_price")
+            if price is None:
+                price = await self._extract_xianyu_order_price(page)
+            return {
+                "price": float(price or 0),
+                "spec_text": delist_candidate.get("text", ""),
+                "force_decision": "DELIST",
+            }
+
+        en_15d_delist_candidate = next(
+            (
+                candidate
+                for candidate in spec_state.get("options", [])
+                if "15d" in candidate.get("kinds", [])
+                and self._looks_like_english_order_text(
+                    " ".join([candidate.get("text", ""), spec_state.get("order_text", "")])
+                )
+            ),
+            None,
+        )
+        if en_15d_delist_candidate:
+            price = en_15d_delist_candidate.get("option_price")
+            if price is None:
+                price = await self._extract_xianyu_order_price(page)
+            return {
+                "price": float(price or 0),
+                "spec_text": " ".join([en_15d_delist_candidate.get("text", ""), spec_state.get("order_text", "")]).strip(),
+                "force_decision": "DELIST",
+            }
+
         if not spec_state.get("has_options"):
             price = await self._extract_xianyu_order_price(page)
-            return {"price": price, "spec_text": ""} if price is not None else None
+            order_text = await self._extract_xianyu_order_item_text(page)
+            if price is not None and self._looks_like_cn_7d_delist_order(order_text, price):
+                return {"price": price, "spec_text": order_text, "force_decision": "DELIST"}
+            return {"price": price, "spec_text": order_text} if price is not None else None
 
         if not candidates:
             return None
 
         offers = []
-        for candidate in candidates[:6]:
+        exact_candidates = [candidate for candidate in candidates if candidate.get("intent_match")]
+        for candidate in (exact_candidates or candidates)[:6]:
             try:
                 clicked = await page.evaluate(
                     """
@@ -491,7 +617,12 @@ class XianyuAgent(BaseAgent):
 
                     if (optionLooksClickable && optionTextHasSpec && !optionLooksLikeContainer && !optionSeen.has(key)) {
                         optionSeen.add(key);
-                        optionTexts.push(text || rawText);
+                        optionTexts.push({
+                            text: text || rawText,
+                            option_price: parsePrice(text || rawText),
+                            kinds: optionSpecKinds,
+                            intent_match: optionTextMatchesIntent,
+                        });
                     }
 
                     if (!key || seen.has(key)) return;
@@ -505,12 +636,15 @@ class XianyuAgent(BaseAgent):
                         text: text || rawText,
                         option_price: parsePrice(text || rawText),
                         score: scoreSpec(text || rawText, clickEl),
+                        kinds: optionSpecKinds,
+                        intent_match: optionTextMatchesIntent,
                     });
                 });
 
                 candidates.sort((a, b) => b.score - a.score);
                 window.__priceMonitorSkuCandidates = elements;
-                return {has_options: optionTexts.length >= 2, options: optionTexts, candidates};
+                const orderText = clean(document.body.innerText || '');
+                return {has_options: optionTexts.length >= 2, options: optionTexts, candidates, order_text: orderText};
             }
             """,
             intent,
@@ -561,6 +695,41 @@ class XianyuAgent(BaseAgent):
             """
         )
         return float(value) if value else None
+
+    async def _extract_xianyu_order_item_text(self, page: Page) -> str:
+        value = await page.evaluate(
+            r"""
+            () => {
+                const clean = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const lines = clean(document.body.innerText || '')
+                    .split(/(?<=\S)\s+(?=\S)/)
+                    .map(clean)
+                    .filter(Boolean);
+                const matched = lines.find((line) =>
+                    /适趣/i.test(line) && /(?:7天|7日|7day|7days)/i.test(line)
+                );
+                if (matched) return matched;
+                return lines.find((line) => /适趣/i.test(line)) || '';
+            }
+            """
+        )
+        return str(value or "")
+
+    def _looks_like_cn_7d_delist_order(self, text: str, price: float) -> bool:
+        normalized = (text or "").lower().replace(" ", "")
+        return (
+            abs(float(price) - 3.9) < 0.01
+            and "适趣" in normalized
+            and "中文" in normalized
+            and any(token in normalized for token in ("7天", "7日", "7day", "7days"))
+        )
+
+    def _looks_like_english_order_text(self, text: str) -> bool:
+        normalized = (text or "").lower().replace(" ", "")
+        return (
+            "适趣" in normalized
+            and any(token in normalized for token in ("英语", "英文", "english"))
+        )
 
     async def _save_order_debug_snapshot(self, page: Page) -> Path:
         output_dir = Path("data/debug")
