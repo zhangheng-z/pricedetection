@@ -5,26 +5,18 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-
-def shorten_text(text: str, max_len: int = 42) -> str:
-    text = (text or "").strip()
-    if len(text) <= max_len:
-        return text
-    return text[:max_len] + "..."
+from reporter.judgment_labels import to_display_judgment
 
 
 def save_listing_table(rows: Iterable[Mapping], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = list(rows)
-    include_judgment = any(row.get("judgment") for row in rows)
 
     wb = Workbook()
     ws = wb.active
     ws.title = "\u641c\u7d22\u7ed3\u679c"
 
-    headers = ["\u5e8f\u53f7", "\u6807\u9898", "\u4ef7\u683c", "\u5546\u54c1\u94fe\u63a5", "\u5b8c\u6574\u6807\u9898"]
-    if include_judgment:
-        headers.append("\u5224\u5b9a\u7ed3\u679c")
+    headers = ["\u5e8f\u53f7", "\u6807\u9898", "\u4ef7\u683c", "\u5546\u54c1\u94fe\u63a5", "\u5224\u5b9a\u7ed3\u679c", "\u89c4\u683c\u91c7\u96c6\u6a21\u5f0f", "\u89c4\u683c\u91c7\u96c6\u4fe1\u606f"]
     ws.append(headers)
 
     sorted_rows = sorted(
@@ -36,24 +28,24 @@ def save_listing_table(rows: Iterable[Mapping], path: Path) -> Path:
             title = str(row.get("title", ""))
             values = [
                 index,
-                shorten_text(title),
+                title,
                 row.get("price", ""),
                 row.get("url", ""),
-                title,
+                to_display_judgment(str(row.get("judgment", ""))),
+                row.get("spec_capture_mode", ""),
+                row.get("spec_capture_info", ""),
             ]
-            if include_judgment:
-                values.append(row.get("judgment", ""))
             ws.append(values)
     else:
         values = [
             1,
-            "\u65e0\u5339\u914d\u5546\u54c1",
-            "",
-            "",
             "\u672c\u6b21\u641c\u7d22\u672a\u91c7\u96c6\u5230\u7b26\u5408\u6807\u9898\u89c4\u5219\u7684\u5546\u54c1",
+            "",
+            "",
+            "",
+            "",
+            "",
         ]
-        if include_judgment:
-            values.append("")
         ws.append(values)
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
@@ -65,13 +57,13 @@ def save_listing_table(rows: Iterable[Mapping], path: Path) -> Path:
 
     widths = {
         "A": 8,
-        "B": 44,
+        "B": 80,
         "C": 12,
         "D": 64,
-        "E": 80,
+        "E": 16,
+        "F": 20,
+        "G": 80,
     }
-    if include_judgment:
-        widths["F"] = 16
     for column, width in widths.items():
         ws.column_dimensions[column].width = width
 
@@ -80,15 +72,15 @@ def save_listing_table(rows: Iterable[Mapping], path: Path) -> Path:
         row[1].alignment = Alignment(wrap_text=True, vertical="top")
         row[2].alignment = Alignment(horizontal="right", vertical="top")
         row[3].alignment = Alignment(wrap_text=True, vertical="top")
-        row[4].alignment = Alignment(wrap_text=True, vertical="top")
-        if include_judgment and len(row) >= 6:
-            row[5].alignment = Alignment(horizontal="center", vertical="top")
+        row[4].alignment = Alignment(horizontal="center", vertical="top")
+        row[5].alignment = Alignment(horizontal="center", vertical="top")
+        row[6].alignment = Alignment(wrap_text=True, vertical="top")
 
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
 
     if ws.max_row >= 2:
-        table_ref = f"A1:{'F' if include_judgment else 'E'}{ws.max_row}"
+        table_ref = f"A1:G{ws.max_row}"
         table = Table(displayName="SearchResults", ref=table_ref)
         table.tableStyleInfo = TableStyleInfo(
             name="TableStyleMedium2",

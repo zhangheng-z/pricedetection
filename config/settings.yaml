@@ -1,6 +1,6 @@
 llm:
   provider: openai_compatible
-  model: qwen-plus
+  model: qwen3.6-plus
   api_key: "${DASHSCOPE_API_KEY}"
   api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
   temperature: 0.7
@@ -50,6 +50,14 @@ anti_risk:
   max_pages_per_keyword: 30
   max_detail_clicks_per_keyword: 600
   max_detail_clicks_per_run: 600
+  # Poll briefly after opening a detail page so delayed slider verification can be caught.
+  verification_poll_seconds: 8
+  # In headless mode, keep the visible manual verification browser open long
+  # enough for a person to finish the slider before syncing back to headless.
+  headless_verification_min_visible_seconds: 45
+  # After the slider disappears, wait briefly and re-check before closing the
+  # visible browser. This avoids resuming while the verification page is still settling.
+  headless_verification_clear_settle_seconds: 5
 
   # Prefer current-tab navigation over repeatedly opening new tabs.
   open_detail_in_new_page: false

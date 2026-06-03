@@ -11,6 +11,8 @@ SKU_RULES = {
     "EN_YEAR": {"version": "EN", "period": "YEAR", "official_price": 2198.0},
 }
 
+PRICE_TOLERANCE = 0.5
+
 TARGET_KEYWORDS = (
     "\u9002\u8da3",
     "\u9002\u8da3ai",
@@ -48,7 +50,7 @@ class PriceJudge:
         self.llm = llm_client
 
     def is_below_official(self, price: float, official_price: float) -> bool:
-        return price < official_price
+        return price < official_price - PRICE_TOLERANCE
 
     def is_suspiciously_low(self, price: float, official_price: float) -> bool:
         return price < official_price * 0.5
@@ -153,7 +155,7 @@ class PriceJudge:
 
         sku_id = sku_candidates[0]
         sku_price = float(SKU_RULES[sku_id]["official_price"])
-        if price > 0 and price < sku_price:
+        if price > 0 and self.is_below_official(price, sku_price):
             return self._analysis_result(
                 decision="VIOLATION",
                 risk_level="HIGH",

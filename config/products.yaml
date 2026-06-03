@@ -4,7 +4,7 @@ products:
     currency: CNY
     keywords:
       - "适趣AI中文15天"
-    platforms: [xianyu]
+    platforms: [xianyu, taobao]
 
   - name: "适趣AI英文21天"
     official_price: 39.9
@@ -12,19 +12,19 @@ products:
     keywords:
       - "适趣AI英文21天"
       - "适趣AI英语21天"
-    platforms: [xianyu]
+    platforms: [xianyu, taobao]
 
   - name: "适趣AI中文年卡"
     official_price: 2498
     currency: CNY
     keywords:
       - "适趣AI中文年卡"
-    platforms: [xianyu]
-
+    platforms: [xianyu, taobao]
+  
   - name: "适趣AI英文年卡"
     official_price: 2198
     currency: CNY
     keywords:
       - "适趣AI英语年卡"
       - "适趣AI英文年卡"
-    platforms: [xianyu]
+    platforms: [xianyu, taobao]

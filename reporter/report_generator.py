@@ -3,6 +3,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from reporter.judgment_labels import to_display_judgment
 from storage.database import Database
 from storage.models import DailyReport
 
@@ -56,7 +57,7 @@ class ReportGenerator:
                 reason = (alert.reason or "").replace("\n", " ")
                 lines.append(
                     f"| {alert.product_name} | {alert.platform} | {alert.price} | "
-                    f"{alert.official_price} | {alert.judgment} | {reason} |"
+                    f"{alert.official_price} | {to_display_judgment(alert.judgment)} | {reason} |"
                 )
         else:
             lines.extend([

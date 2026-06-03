@@ -13,6 +13,291 @@ from core.anti_detect import AntiDetect
 class XianyuAgent(BaseAgent):
     PLATFORM = "xianyu"
 
+    async def _is_verification_page(self, page: Page) -> bool:
+        if await super()._is_verification_page(page):
+            return True
+
+        for frame in page.frames:
+            try:
+                if await frame.evaluate(self._xianyu_verification_structure_script()):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _xianyu_verification_structure_script(self) -> str:
+        return r"""
+        () => {
+            const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+            const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+            if (!viewportWidth || !viewportHeight || !document.body) return false;
+
+            const text = (document.body.innerText || '').replace(/\s+/g, '');
+            const textMarkers = [
+                '\u8bf7\u62d6\u52a8\u4e0b\u65b9\u6ed1\u5757\u5b8c\u6210\u9a8c\u8bc1',
+                '\u901a\u8fc7\u9a8c\u8bc1\u4ee5\u786e\u4fdd\u6b63\u5e38\u8bbf\u95ee',
+                '\u8bf7\u6309\u4f4f\u6ed1\u5757',
+                '\u62d6\u52a8\u5230\u6700\u53f3\u8fb9'
+            ];
+            if (textMarkers.some((marker) => text.includes(marker))) return true;
+
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' &&
+                    style.display !== 'none' &&
+                    Number(style.opacity || 1) > 0;
+            };
+            const rectOf = (el) => el.getBoundingClientRect();
+            const elements = Array.from(document.querySelectorAll('body *')).filter(visible);
+
+            const dialogs = elements.filter((el) => {
+                const rect = rectOf(el);
+                const style = window.getComputedStyle(el);
+                const centerX = rect.left + rect.width / 2;
+                const centerY = rect.top + rect.height / 2;
+                const centered =
+                    Math.abs(centerX - viewportWidth / 2) < viewportWidth * 0.18 &&
+                    Math.abs(centerY - viewportHeight / 2) < viewportHeight * 0.22;
+                const dialogSized =
+                    rect.width >= 300 && rect.width <= Math.min(620, viewportWidth * 0.75) &&
+                    rect.height >= 200 && rect.height <= Math.min(520, viewportHeight * 0.75);
+                const bg = style.backgroundColor || '';
+                const whiteLike =
+                    /rgb\(\s*2[3-5]\d\s*,\s*2[3-5]\d\s*,\s*2[3-5]\d\s*\)/.test(bg) ||
+                    /rgba\(\s*2[3-5]\d\s*,\s*2[3-5]\d\s*,\s*2[3-5]\d\s*,\s*(0\.[8-9]|1)/.test(bg);
+                const rounded = Number.parseFloat(style.borderRadius || '0') >= 8;
+                return centered && dialogSized && (whiteLike || rounded);
+            });
+            if (!dialogs.length) return false;
+
+            return dialogs.some((dialog) => {
+                const dialogRect = rectOf(dialog);
+                const insideDialog = (el) => {
+                    const rect = rectOf(el);
+                    return rect.left >= dialogRect.left - 4 &&
+                        rect.right <= dialogRect.right + 4 &&
+                        rect.top >= dialogRect.top - 4 &&
+                        rect.bottom <= dialogRect.bottom + 4;
+                };
+                const dialogElements = elements.filter((el) => el !== dialog && insideDialog(el));
+                const tracks = dialogElements.filter((el) => {
+                    const rect = rectOf(el);
+                    const style = window.getComputedStyle(el);
+                    const horizontalTrack =
+                        rect.width >= 180 &&
+                        rect.width <= Math.min(420, dialogRect.width * 0.9) &&
+                        rect.height >= 24 &&
+                        rect.height <= 70 &&
+                        rect.width / Math.max(rect.height, 1) >= 4;
+                    const rounded = Number.parseFloat(style.borderRadius || '0') >= 10;
+                    return horizontalTrack && rounded;
+                });
+
+                return tracks.some((track) => {
+                    const trackRect = rectOf(track);
+                    return dialogElements.some((el) => {
+                        if (el === track) return false;
+                        const rect = rectOf(el);
+                        const handleSized =
+                            rect.width >= 24 && rect.width <= 80 &&
+                            rect.height >= 24 && rect.height <= 80;
+                        const nearTrackStart =
+                            rect.left >= trackRect.left - 12 &&
+                            rect.left <= trackRect.left + trackRect.width * 0.25;
+                        const verticallyAligned =
+                            rect.top >= trackRect.top - 16 &&
+                            rect.bottom <= trackRect.bottom + 16;
+                        return handleSized && nearTrackStart && verticallyAligned;
+                    });
+                });
+            });
+        }
+        """
+
+    async def _is_manual_verification_cleared(self, page: Page) -> bool:
+        try:
+            return await page.evaluate(
+                r"""
+                () => {
+                    const visible = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 &&
+                            style.visibility !== 'hidden' &&
+                            style.display !== 'none' &&
+                            Number(style.opacity || 1) > 0;
+                    };
+                    const buyLabels = [
+                        '\u7acb\u5373\u8d2d\u4e70',
+                        '\u9a6c\u4e0a\u8d2d\u4e70',
+                        '\u7acb\u5373\u4e0b\u5355'
+                    ];
+                    const hasBuyAction = Array.from(document.querySelectorAll('button, [role="button"], div, span, a'))
+                        .some((el) => {
+                            if (!visible(el)) return false;
+                            const text = (el.innerText || el.textContent || '').replace(/\s+/g, '');
+                            return buyLabels.some((label) => text.includes(label));
+                        });
+                    if (hasBuyAction) return true;
+
+                    const bodyText = (document.body?.innerText || '').replace(/\s+/g, '');
+                    const normalPageText = [
+                        '\u5546\u54c1\u8be6\u60c5',
+                        '\u5b9d\u8d1d\u8be6\u60c5',
+                        '\u6211\u60f3\u8981',
+                        '\u52a0\u5165\u8d2d\u7269\u8f66',
+                        '\u786e\u8ba4\u8ba2\u5355',
+                        '\u63d0\u4ea4\u8ba2\u5355'
+                    ];
+                    if (normalPageText.some((marker) => bodyText.includes(marker))) {
+                        return true;
+                    }
+
+                    const verificationText = [
+                        '\u8bf7\u62d6\u52a8\u4e0b\u65b9\u6ed1\u5757\u5b8c\u6210\u9a8c\u8bc1',
+                        '\u901a\u8fc7\u9a8c\u8bc1\u4ee5\u786e\u4fdd\u6b63\u5e38\u8bbf\u95ee',
+                        '\u8bf7\u6309\u4f4f\u6ed1\u5757',
+                        '\u62d6\u52a8\u5230\u6700\u53f3\u8fb9'
+                    ];
+                    return !verificationText.some((marker) => bodyText.includes(marker));
+                }
+                """
+            )
+        except Exception:
+            return False
+
+    def _format_price_text(self, price: Optional[float]) -> str:
+        if price is None:
+            return ""
+        return f"{float(price):g}"
+
+    def _format_spec_capture_info(self, mode: str, spec_text: str, price: Optional[float], options: list) -> str:
+        if mode == "order_text_only":
+            parts = []
+            if spec_text:
+                parts.append(str(spec_text).strip())
+            if price is not None:
+                parts.append(f"价格:{self._format_price_text(price)}")
+            return " | ".join(parts)
+
+        if mode == "options_detected":
+            items = []
+            for option in options or []:
+                text = str(option.get("text", "")).strip()
+                option_price = option.get("option_price")
+                if not text:
+                    continue
+                item = text
+                if option_price is not None:
+                    item = f"{item}: {self._format_price_text(option_price)}"
+                if option.get("sold_out"):
+                    item = f"{item} 已售罄"
+                items.append(item)
+            return "；".join(items)
+
+        return ""
+
+    async def _click_xianyu_option(self, page: Page, candidate: Dict[str, Any]) -> bool:
+        token = str(candidate.get("token", "")).strip()
+        if not token:
+            return False
+
+        try:
+            locator = page.locator(f'[data-price-monitor-sku-token="{token}"]').first
+            if await locator.count() == 0:
+                return False
+            await locator.scroll_into_view_if_needed(timeout=3000)
+            try:
+                await locator.hover(timeout=2000)
+            except Exception:
+                pass
+            await locator.click(timeout=5000)
+            await self._wait_for_verification_appearance(page, "after option click", timeout_seconds=3)
+            return True
+        except Exception:
+            return False
+
+    async def _probe_xianyu_option_state(self, page: Page, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        before_sold_out_count = await page.evaluate(
+            r"""
+            () => {
+                const text = (document.body.innerText || '').replace(/\s+/g, ' ').trim();
+                const matches = text.match(/该时长暂无库存|暂无库存|已售罄|售罄/g);
+                return matches ? matches.length : 0;
+            }
+            """
+        )
+        clicked = await self._click_xianyu_option(page, candidate)
+        if not clicked:
+            return {"clicked": False, "sold_out": False, "price": None}
+
+        await AntiDetect.random_delay(0.7, 1.2)
+        after_sold_out_count = await page.evaluate(
+            r"""
+            () => {
+                const text = (document.body.innerText || '').replace(/\s+/g, ' ').trim();
+                const matches = text.match(/该时长暂无库存|暂无库存|已售罄|售罄/g);
+                return matches ? matches.length : 0;
+            }
+            """
+        )
+        sold_out = after_sold_out_count > before_sold_out_count
+        price = None if sold_out else await self._extract_xianyu_order_price(page)
+        return {"clicked": True, "sold_out": sold_out, "price": price}
+
+    async def _resolve_xianyu_option_prices(self, page: Page, spec_state: Dict[str, Any]) -> Dict[str, Any]:
+        options = [dict(option) for option in spec_state.get("options", [])]
+        candidates = [dict(candidate) for candidate in spec_state.get("candidates", [])]
+        if not options or not candidates:
+            return spec_state
+
+        price_by_text = {}
+        sold_out_by_text = {}
+        for candidate in candidates:
+            text = str(candidate.get("text", "")).strip()
+            if not text:
+                continue
+            if candidate.get("option_price") is not None and candidate.get("sold_out") is not True:
+                price_by_text[text] = candidate.get("option_price")
+            if candidate.get("sold_out") is True:
+                sold_out_by_text[text] = True
+            if candidate.get("option_price") is not None and candidate.get("sold_out") is not None:
+                continue
+
+            try:
+                probe = await self._probe_xianyu_option_state(page, candidate)
+                if not probe.get("clicked"):
+                    continue
+                candidate["sold_out"] = bool(probe.get("sold_out"))
+                sold_out_by_text[text] = bool(probe.get("sold_out"))
+                resolved_price = probe.get("price")
+                if resolved_price is None:
+                    continue
+                candidate["option_price"] = float(resolved_price)
+                price_by_text[text] = float(resolved_price)
+            except Exception:
+                continue
+
+        for option in options:
+            text = str(option.get("text", "")).strip()
+            if text in sold_out_by_text:
+                option["sold_out"] = sold_out_by_text[text]
+            if option.get("option_price") is None and text in price_by_text:
+                option["option_price"] = price_by_text[text]
+
+        for candidate in candidates:
+            text = str(candidate.get("text", "")).strip()
+            if text in sold_out_by_text:
+                candidate["sold_out"] = sold_out_by_text[text]
+            if candidate.get("option_price") is None and text in price_by_text:
+                candidate["option_price"] = price_by_text[text]
+
+        spec_state["options"] = options
+        spec_state["candidates"] = candidates
+        return spec_state
+
     async def _do_search(self, page: Page, keyword: str):
         print(f"[{self.PLATFORM}] opening home page", flush=True)
         await page.goto("https://www.goofish.com/", wait_until="domcontentloaded", timeout=30000)
@@ -361,19 +646,36 @@ class XianyuAgent(BaseAgent):
         detail_page = await source_page.context.new_page()
         try:
             await detail_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                await detail_page.bring_to_front()
+            except Exception:
+                pass
             await AntiDetect.random_delay(1, 2)
+            await self._wait_for_verification_appearance(detail_page, "after detail open")
 
             if not await self._click_buy_now(detail_page):
-                print(f"[{self.PLATFORM}] buy button not found: {title[:40]}", flush=True)
-                return None
+                if await self._wait_for_verification_appearance(
+                    detail_page,
+                    "before buy retry",
+                    timeout_seconds=3,
+                ):
+                    if not await self._click_buy_now(detail_page):
+                        print(f"[{self.PLATFORM}] buy button not found: {title[:40]}", flush=True)
+                        return None
+                else:
+                    print(f"[{self.PLATFORM}] buy button not found: {title[:40]}", flush=True)
+                    return None
 
             await AntiDetect.random_delay(1.5, 3)
             try:
                 await detail_page.wait_for_load_state("networkidle", timeout=10000)
             except PlaywrightTimeoutError:
                 pass
+            await self._wait_for_verification_appearance(detail_page, "after buy click", timeout_seconds=5)
 
+            await self._wait_if_verification(detail_page, "before order spec extraction")
             offer = await self._select_matching_order_offer(detail_page, keyword)
+            await self._wait_if_verification(detail_page, "after order spec extraction")
             if offer is None:
                 debug_path = await self._save_order_debug_snapshot(detail_page)
                 print(f"[{self.PLATFORM}] matching order spec/price not found, debug saved: {debug_path}", flush=True)
@@ -413,10 +715,16 @@ class XianyuAgent(BaseAgent):
     async def _select_matching_order_offer(self, page: Page, keyword: str) -> Optional[Dict[str, Any]]:
         intent = self._search_intent(keyword)
         spec_state = await self._collect_xianyu_order_options(page, intent)
+        if spec_state.get("has_options"):
+            spec_state = await self._resolve_xianyu_option_prices(page, spec_state)
         candidates = spec_state.get("candidates", [])
 
         delist_candidate = next(
-            (candidate for candidate in spec_state.get("options", []) if "7d" in candidate.get("kinds", [])),
+            (
+                candidate
+                for candidate in spec_state.get("options", [])
+                if "7d" in candidate.get("kinds", []) and not candidate.get("sold_out")
+            ),
             None,
         )
         if delist_candidate:
@@ -426,6 +734,13 @@ class XianyuAgent(BaseAgent):
             return {
                 "price": float(price or 0),
                 "spec_text": delist_candidate.get("text", ""),
+                "spec_capture_mode": "options_detected",
+                "spec_capture_info": self._format_spec_capture_info(
+                    "options_detected",
+                    delist_candidate.get("text", ""),
+                    price,
+                    spec_state.get("options", []),
+                ),
                 "force_decision": "DELIST",
             }
 
@@ -434,6 +749,7 @@ class XianyuAgent(BaseAgent):
                 candidate
                 for candidate in spec_state.get("options", [])
                 if "15d" in candidate.get("kinds", [])
+                and not candidate.get("sold_out")
                 and self._looks_like_english_order_text(
                     " ".join([candidate.get("text", ""), spec_state.get("order_text", "")])
                 )
@@ -444,9 +760,17 @@ class XianyuAgent(BaseAgent):
             price = en_15d_delist_candidate.get("option_price")
             if price is None:
                 price = await self._extract_xianyu_order_price(page)
+            spec_text = " ".join([en_15d_delist_candidate.get("text", ""), spec_state.get("order_text", "")]).strip()
             return {
                 "price": float(price or 0),
-                "spec_text": " ".join([en_15d_delist_candidate.get("text", ""), spec_state.get("order_text", "")]).strip(),
+                "spec_text": spec_text,
+                "spec_capture_mode": "options_detected",
+                "spec_capture_info": self._format_spec_capture_info(
+                    "options_detected",
+                    spec_text,
+                    price,
+                    spec_state.get("options", []),
+                ),
                 "force_decision": "DELIST",
             }
 
@@ -454,8 +778,19 @@ class XianyuAgent(BaseAgent):
             price = await self._extract_xianyu_order_price(page)
             order_text = await self._extract_xianyu_order_item_text(page)
             if price is not None and self._looks_like_cn_7d_delist_order(order_text, price):
-                return {"price": price, "spec_text": order_text, "force_decision": "DELIST"}
-            return {"price": price, "spec_text": order_text} if price is not None else None
+                return {
+                    "price": price,
+                    "spec_text": order_text,
+                    "spec_capture_mode": "order_text_only",
+                    "spec_capture_info": self._format_spec_capture_info("order_text_only", order_text, price, []),
+                    "force_decision": "DELIST",
+                }
+            return {
+                "price": price,
+                "spec_text": order_text,
+                "spec_capture_mode": "order_text_only",
+                "spec_capture_info": self._format_spec_capture_info("order_text_only", order_text, price, []),
+            } if price is not None else None
 
         if not candidates:
             return None
@@ -464,21 +799,7 @@ class XianyuAgent(BaseAgent):
         exact_candidates = [candidate for candidate in candidates if candidate.get("intent_match")]
         for candidate in (exact_candidates or candidates)[:6]:
             try:
-                clicked = await page.evaluate(
-                    """
-                    (index) => {
-                        const el = window.__priceMonitorSkuCandidates?.[index];
-                        if (!el) return false;
-                        el.scrollIntoView({block: 'center', inline: 'center'});
-                        el.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
-                        el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
-                        el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
-                        el.click();
-                        return true;
-                    }
-                    """,
-                    candidate["index"],
-                )
+                clicked = await self._click_xianyu_option(page, candidate)
                 if not clicked:
                     continue
                 await AntiDetect.random_delay(0.7, 1.2)
@@ -487,7 +808,17 @@ class XianyuAgent(BaseAgent):
                 price = option_price if option_price is not None else await self._extract_xianyu_order_price(page)
                 if price is None:
                     continue
-                offers.append({"price": float(price), "spec_text": candidate.get("text", "")})
+                offers.append({
+                    "price": float(price),
+                    "spec_text": candidate.get("text", ""),
+                    "spec_capture_mode": "options_detected",
+                    "spec_capture_info": self._format_spec_capture_info(
+                        "options_detected",
+                        candidate.get("text", ""),
+                        price,
+                        spec_state.get("options", []),
+                    ),
+                })
             except Exception:
                 continue
 
@@ -557,6 +888,16 @@ class XianyuAgent(BaseAgent):
                     '[class*="option"]',
                     '[class*="Option"]'
                 ].join(','));
+                const isSoldOut = (el, text) => {
+                    const classText = `${el.className || ''} ${el.getAttribute('aria-disabled') || ''} ${el.getAttribute('disabled') || ''}`.toLowerCase();
+                    return Boolean(
+                        el.hasAttribute('disabled') ||
+                        el.getAttribute('disabled') === 'true' ||
+                        el.getAttribute('aria-disabled') === 'true' ||
+                        /disabled|soldout|sold-out|empty|invalid|forbid/.test(classText) ||
+                        /(?:\u65e0\u5e93\u5b58|\u552e\u7f44|\u5df2\u552e\u7f44|\u6682\u65e0\u5e93\u5b58)/.test(text)
+                    );
+                };
                 const scoreSpec = (text, el) => {
                     const value = norm(text);
                     let score = 0;
@@ -614,6 +955,7 @@ class XianyuAgent(BaseAgent):
                     const optionTextMatchesIntent = specMatches(key);
                     const optionSpecKinds = specKinds(key);
                     const optionLooksLikeContainer = optionSpecKinds.length > 1;
+                    const optionSoldOut = isSoldOut(clickEl, text || rawText);
 
                     if (optionLooksClickable && optionTextHasSpec && !optionLooksLikeContainer && !optionSeen.has(key)) {
                         optionSeen.add(key);
@@ -622,22 +964,27 @@ class XianyuAgent(BaseAgent):
                             option_price: parsePrice(text || rawText),
                             kinds: optionSpecKinds,
                             intent_match: optionTextMatchesIntent,
+                            sold_out: optionSoldOut,
                         });
                     }
 
                     if (!key || seen.has(key)) return;
                     if (rejectedShellText(key) && !hasSpecToken(key)) return;
-                    if (!optionLooksClickable || !optionTextHasSpec || optionLooksLikeContainer || !optionTextMatchesIntent) return;
+                    if (!optionLooksClickable || !optionTextHasSpec || optionLooksLikeContainer) return;
                     seen.add(key);
                     const index = elements.length;
+                    const token = `price-monitor-sku-${index}`;
+                    clickEl.setAttribute('data-price-monitor-sku-token', token);
                     elements.push(clickEl);
                     candidates.push({
                         index,
+                        token,
                         text: text || rawText,
                         option_price: parsePrice(text || rawText),
                         score: scoreSpec(text || rawText, clickEl),
                         kinds: optionSpecKinds,
                         intent_match: optionTextMatchesIntent,
+                        sold_out: optionSoldOut,
                     });
                 });
 
