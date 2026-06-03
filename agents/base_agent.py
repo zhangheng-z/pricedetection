@@ -22,6 +22,13 @@ class BaseAgent:
     """平台 Agent 基类"""
 
     PLATFORM = ""
+    VERIFICATION_TEXT_MARKERS = (
+        "\u8bf7\u62d6\u52a8\u4e0b\u65b9\u6ed1\u5757\u5b8c\u6210\u9a8c\u8bc1",
+        "\u8bf7\u62d6\u52a8\u4e0b\u65b9\u6ed1\u5757",
+        "\u901a\u8fc7\u9a8c\u8bc1\u4ee5\u786e\u4fdd\u6b63\u5e38\u8bbf\u95ee",
+        "\u8bf7\u6309\u4f4f\u6ed1\u5757\uff0c\u62d6\u52a8\u5230\u6700\u53f3\u8fb9",
+        "\u8bf7\u6309\u4f4f\u6ed1\u5757\u62d6\u52a8\u5230\u6700\u53f3\u8fb9",
+    )
 
     def __init__(
         self,
@@ -53,6 +60,7 @@ class BaseAgent:
             max_pages_per_keyword=5,
             max_detail_clicks_per_keyword=5,
             max_detail_clicks_per_run=8,
+            verification_poll_seconds=8,
             open_detail_in_new_page=False,
             browser_backend="cloakbrowser",
             cloak_stealth_args=True,
@@ -76,6 +84,7 @@ class BaseAgent:
         self.title_filtered_count = 0
         self.detail_clicks_by_keyword: Dict[str, int] = {}
         self.detail_clicks_total = 0
+        self.verification_clear_count = 0
 
     async def run(self) -> Tuple[int, int]:
         """执行一次完整的搜索+判价流程，返回 (listings_count, alerts_count)"""
@@ -120,7 +129,7 @@ class BaseAgent:
         alerts_created = 0
 
         try:
-            selected_keywords = [random.choice(keywords)]
+            selected_keywords = self._select_keywords(keywords)
             print(f"[{self.PLATFORM}] selected keywords: {selected_keywords}", flush=True)
             for keyword_index, keyword in enumerate(selected_keywords, start=1):
                 print(
@@ -128,10 +137,16 @@ class BaseAgent:
                     flush=True,
                 )
                 await self._do_search(page, keyword)
+                await self._wait_if_verification(page, "after search")
                 page_index = 1
                 configured_max_pages = self._anti_risk_int("max_pages_per_keyword", 50)
                 max_pages = configured_max_pages if configured_max_pages > 0 else 9999
+                actual_total_pages = await self._get_total_results_pages(page)
+                if actual_total_pages > 0:
+                    max_pages = min(max_pages, actual_total_pages)
+                    print(f"[{self.PLATFORM}] total results pages: {actual_total_pages}, scan pages: {max_pages}", flush=True)
                 while page_index <= max_pages:
+                    await self._wait_if_verification(page, f"before extracting page {page_index}")
                     print(f"[{self.PLATFORM}] extracting listings page {page_index}...", flush=True)
                     raw_items = await asyncio.wait_for(
                         self.search_engine.extract_listings(page, self.PLATFORM),
@@ -147,6 +162,7 @@ class BaseAgent:
 
                     if not await self._goto_next_results_page(page):
                         break
+                    await self._wait_if_verification(page, "after next page")
                     page_index += 1
                 if page_index > max_pages:
                     print(f"[{self.PLATFORM}] stopped at max page limit: {max_pages}", flush=True)
@@ -188,6 +204,7 @@ class BaseAgent:
         alerts_created = 0
 
         for item in raw_items:
+            await self._wait_if_verification(page, "while processing listings")
             self.raw_items_seen += 1
             title = item.get("title", "").strip()
             url = item.get("url", "").strip()
@@ -201,16 +218,16 @@ class BaseAgent:
                 self.title_filtered_count += 1
                 continue
 
-            if list_price in {3.9, 9.9, 39.9, 2498.0, 2198.0}:
+            if self._should_skip_ignored_list_price(list_price):
                 print(
                     f"[{self.PLATFORM}] skip detail: ignored list price {list_price}",
                     flush=True,
                 )
                 continue
 
-            if list_price >= self.product.official_price:
+            if not self._should_open_detail_by_list_price(list_price, self.product.official_price):
                 print(
-                    f"[{self.PLATFORM}] skip detail: list price {list_price} >= official {self.product.official_price}",
+                    f"[{self.PLATFORM}] skip detail: list price {list_price} within tolerance of official {self.product.official_price}",
                     flush=True,
                 )
                 continue
@@ -237,8 +254,18 @@ class BaseAgent:
             self.detail_clicks_by_keyword[keyword] = self.detail_clicks_by_keyword.get(keyword, 0) + 1
             self.detail_clicks_total += 1
             await self._anti_risk_delay("detail_click_delay_seconds", "before detail")
+            verification_marker = self.verification_clear_count
             order_offer = await self._fetch_order_offer(page, url, title, keyword)
             await self._anti_risk_delay("post_detail_cooldown_seconds", "after detail")
+            if order_offer is None and self.verification_clear_count > verification_marker:
+                print(
+                    f"[{self.PLATFORM}] verification cleared while checking current item; "
+                    f"rechecking to avoid omission: {title[:40]}",
+                    flush=True,
+                )
+                await self._anti_risk_delay("detail_click_delay_seconds", "before omission recheck")
+                order_offer = await self._fetch_order_offer(page, url, title, keyword)
+                await self._anti_risk_delay("post_detail_cooldown_seconds", "after omission recheck")
             if order_offer is None:
                 continue
             final_price = order_offer["price"]
@@ -263,19 +290,29 @@ class BaseAgent:
             listing.id = listing_id
             listings_found += 1
 
-            if listing.price > 0 and self.price_judge.is_below_official(
-                listing.price, self.product.official_price
-            ):
+            analysis = self.price_judge.analyze_listing(
+                title=listing.title,
+                price=listing.price,
+                product_name=self.product.name,
+                official_price=self.product.official_price,
+                spec_text=order_offer.get("spec_text", ""),
+            )
+            if order_offer.get("force_decision") == "DELIST":
+                analysis["decision"] = "DELIST"
+                analysis["risk_level"] = "HIGH"
+                analysis["price_judgement_type"] = "DELIST_REQUIRED"
+                analysis["reason"] = "\u53ef\u552e\u89c4\u683c\u547d\u4e2d\u9002\u8da3AI\u4e2d\u65877\u5929\uff0c\u9700\u4e0b\u67b6"
+            decision = str(analysis.get("decision", "UNKNOWN"))
+
+            if decision in {"VIOLATION", "SUSPECTED", "REVIEW", "DELIST"}:
                 print(
-                    f"[{self.PLATFORM}] price alert candidate: {listing.price} < {self.product.official_price}",
+                    f"[{self.PLATFORM}] price alert candidate: {decision} "
+                    f"(price={listing.price}, official={self.product.official_price})",
                     flush=True,
                 )
-                judgment = await self.price_judge.llm_confirm_violation(
-                    title=listing.title,
-                    price=listing.price,
-                    product_name=self.product.name,
-                    official_price=self.product.official_price,
-                )
+                setattr(listing, "judgment", decision)
+                setattr(listing, "spec_capture_mode", order_offer.get("spec_capture_mode", ""))
+                setattr(listing, "spec_capture_info", order_offer.get("spec_capture_info", ""))
                 alert = PriceAlert(
                     listing_id=listing_id,
                     platform=self.PLATFORM,
@@ -283,8 +320,8 @@ class BaseAgent:
                     title=listing.title,
                     price=listing.price,
                     official_price=self.product.official_price,
-                    judgment=judgment.get("judgment", "violation"),
-                    reason=judgment.get("reason", ""),
+                    judgment=decision,
+                    reason=self.price_judge.format_analysis_reason(analysis),
                 )
                 self.db.save_alert(alert)
                 self.collected_listings.append(listing)
@@ -292,8 +329,20 @@ class BaseAgent:
 
         return listings_found, alerts_created
 
+    def _select_keywords(self, keywords: List[str]) -> List[str]:
+        return [random.choice(keywords)]
+
+    def _should_skip_ignored_list_price(self, list_price: float) -> bool:
+        return list_price in {9.9, 39.9, 2498.0, 2198.0}
+
+    def _should_open_detail_by_list_price(self, list_price: float, official_price: float) -> bool:
+        return self.price_judge.is_below_official(list_price, official_price)
+
     async def _goto_next_results_page(self, page: Page) -> bool:
         return False
+
+    async def _get_total_results_pages(self, page: Page) -> int:
+        return 0
 
     async def _fetch_order_offer(
         self,
@@ -350,6 +399,9 @@ class BaseAgent:
             print(f"[{self.PLATFORM}] anti-risk delay {label}: {seconds:.1f}s", flush=True)
         await asyncio.sleep(seconds)
 
+    def _mark_verification_cleared(self) -> None:
+        self.verification_clear_count += 1
+
     async def _select_matching_order_offer(self, page: Page, keyword: str) -> Optional[Dict[str, Any]]:
         return None
 
@@ -367,6 +419,411 @@ class BaseAgent:
         await page.screenshot(path=str(base.with_suffix(".png")), full_page=True)
         base.with_suffix(".html").write_text(await page.content(), encoding="utf-8")
         return base.with_suffix(".png")
+
+    async def _wait_if_verification(self, page: Page, label: str = "") -> bool:
+        if not getattr(self.anti_risk, "stop_on_verification", True):
+            return False
+
+        if not await self._is_verification_page(page):
+            return False
+
+        if self.headless:
+            if await self._resolve_headless_verification(page, label):
+                self._mark_verification_cleared()
+                return True
+            raise RuntimeError(
+                f"[{self.PLATFORM}] headless verification was not cleared. "
+                "Keep the visible helper browser open and finish the slider before continuing."
+            )
+
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+
+        where = f" {label}" if label else ""
+        print(
+            f"[{self.PLATFORM}] verification detected{where}. "
+            "Automation is paused. 请在打开的浏览器中手动拖动滑块完成验证，完成后程序会自动继续。",
+            flush=True,
+        )
+        wait_seconds = 0
+        while await self._is_verification_page(page):
+            await asyncio.sleep(5)
+            wait_seconds += 5
+            if wait_seconds % 30 == 0:
+                print(
+                    f"[{self.PLATFORM}] still waiting for manual slider verification ({wait_seconds}s).",
+                    flush=True,
+                )
+
+        print(f"[{self.PLATFORM}] verification cleared; resuming.", flush=True)
+        self._mark_verification_cleared()
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        await AntiDetect.random_delay(1, 2)
+        return True
+
+    async def _resolve_headless_verification(self, page: Page, label: str = "") -> bool:
+        url = page.url
+        if not url or url == "about:blank":
+            return False
+
+        where = f" {label}" if label else ""
+        print(
+            f"[{self.PLATFORM}] verification detected{where} in headless mode. "
+            "Opening a visible browser for manual slider verification.",
+            flush=True,
+        )
+
+        state_path = await self._save_temporary_storage_state(page)
+        helper = BrowserManager(
+            proxy=self.proxy,
+            headless=False,
+            storage_state=str(state_path) if state_path else (self.account.storage_state or None),
+            user_data_dir=None,
+            browser_channel=self.account.browser_channel or "msedge",
+            browser_backend=getattr(self.anti_risk, "browser_backend", "cloakbrowser"),
+            cloak_stealth_args=bool(getattr(self.anti_risk, "cloak_stealth_args", True)),
+            cloak_humanize=bool(getattr(self.anti_risk, "cloak_humanize", True)),
+            cloak_human_preset=getattr(self.anti_risk, "cloak_human_preset", "careful"),
+            cloak_binary_path=getattr(self.anti_risk, "cloak_binary_path", "") or None,
+            cloak_start_timeout_seconds=int(getattr(self.anti_risk, "cloak_start_timeout_seconds", 120)),
+            stealth_mode=bool(getattr(self.anti_risk, "stealth_mode", False)),
+            randomize_user_agent=bool(getattr(self.anti_risk, "randomize_user_agent", False)),
+            randomize_viewport=bool(getattr(self.anti_risk, "randomize_viewport", False)),
+        )
+
+        try:
+            await helper.start()
+            helper_page = await helper.new_page()
+            await helper_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                await helper_page.bring_to_front()
+            except Exception:
+                pass
+            print(
+                f"[{self.PLATFORM}] visible verification browser opened. "
+                "Please finish the slider there; the headless task will resume automatically.",
+                flush=True,
+            )
+            return await self._wait_for_headless_verification_clear(page, helper_page, state_path)
+        except Exception as exc:
+            print(f"[{self.PLATFORM}] failed to open visible verification browser: {exc}", flush=True)
+            return False
+        finally:
+            try:
+                await helper.stop()
+            except Exception:
+                pass
+
+    async def _save_temporary_storage_state(self, page: Page) -> Optional[Path]:
+        try:
+            output_dir = Path("data/debug")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = output_dir / f"{timestamp}_{self.PLATFORM}_headless_verification_state.json"
+            await page.context.storage_state(path=str(path))
+            return path
+        except Exception as exc:
+            print(f"[{self.PLATFORM}] failed to save temporary browser state: {exc}", flush=True)
+            return None
+
+    async def _wait_for_headless_verification_clear(
+        self,
+        page: Page,
+        helper_page: Page,
+        state_path: Optional[Path],
+    ) -> bool:
+        wait_seconds = 0
+        loop = asyncio.get_running_loop()
+        opened_at = loop.time()
+        min_visible_seconds = max(0, self._anti_risk_int("headless_verification_min_visible_seconds", 45))
+        clear_settle_seconds = max(0, self._anti_risk_int("headless_verification_clear_settle_seconds", 5))
+        helper_verification_seen = False
+        while True:
+            helper_closed = helper_page.is_closed()
+            if not helper_closed:
+                try:
+                    helper_has_verification = await self._is_verification_page(helper_page)
+                    if helper_has_verification:
+                        helper_verification_seen = True
+                        helper_manual_cleared = False
+                        print(
+                            f"[{self.PLATFORM}] waiting for manual slider verification in visible browser.",
+                            flush=True,
+                        )
+                        while await self._is_verification_page(helper_page):
+                            if await self._is_manual_verification_cleared(helper_page):
+                                helper_manual_cleared = True
+                                print(
+                                    f"[{self.PLATFORM}] visible verification appears cleared; syncing state.",
+                                    flush=True,
+                                )
+                                break
+                            await asyncio.sleep(5)
+                            wait_seconds += 5
+                            if wait_seconds % 30 == 0:
+                                print(
+                                    f"[{self.PLATFORM}] still waiting for visible slider verification ({wait_seconds}s).",
+                                    flush=True,
+                                )
+                        if clear_settle_seconds:
+                            await asyncio.sleep(clear_settle_seconds)
+                            wait_seconds += clear_settle_seconds
+                            if (
+                                not helper_manual_cleared
+                                and await self._is_verification_page(helper_page)
+                            ):
+                                continue
+                except Exception:
+                    helper_closed = True
+
+            visible_elapsed = loop.time() - opened_at
+            if not helper_closed and visible_elapsed < min_visible_seconds:
+                await asyncio.sleep(min(2, min_visible_seconds - visible_elapsed))
+                wait_seconds += min(2, max(0, min_visible_seconds - visible_elapsed))
+                continue
+
+            if not helper_closed:
+                await self._sync_helper_state_to_headless(helper_page, page, state_path)
+
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+
+            if not await self._is_verification_page(page):
+                if helper_verification_seen and clear_settle_seconds:
+                    await asyncio.sleep(clear_settle_seconds)
+                    if not helper_closed:
+                        await self._sync_helper_state_to_headless(helper_page, page, state_path)
+                    try:
+                        await page.reload(wait_until="domcontentloaded", timeout=30000)
+                    except Exception:
+                        pass
+                    if await self._is_verification_page(page):
+                        continue
+                print(f"[{self.PLATFORM}] headless verification cleared; resuming.", flush=True)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                await AntiDetect.random_delay(1, 2)
+                return True
+
+            if helper_closed:
+                print(
+                    f"[{self.PLATFORM}] visible verification browser was closed, "
+                    "but the headless page is still under verification.",
+                    flush=True,
+                )
+                return False
+
+            await asyncio.sleep(5)
+            wait_seconds += 5
+            if wait_seconds % 30 == 0:
+                print(
+                    f"[{self.PLATFORM}] headless page still waits for verification ({wait_seconds}s).",
+                    flush=True,
+                )
+
+    async def _sync_helper_state_to_headless(
+        self,
+        helper_page: Page,
+        headless_page: Page,
+        state_path: Optional[Path],
+    ) -> None:
+        try:
+            if state_path:
+                await helper_page.context.storage_state(path=str(state_path))
+                if self.account.storage_state:
+                    await helper_page.context.storage_state(path=self.account.storage_state)
+            cookies = await helper_page.context.cookies()
+            if cookies:
+                await headless_page.context.add_cookies(cookies)
+        except Exception as exc:
+            print(f"[{self.PLATFORM}] failed to sync verification browser state: {exc}", flush=True)
+
+    async def _is_manual_verification_cleared(self, page: Page) -> bool:
+        return False
+
+    async def _wait_for_verification_appearance(
+        self,
+        page: Page,
+        label: str = "",
+        timeout_seconds: Optional[int] = None,
+    ) -> bool:
+        if not getattr(self.anti_risk, "stop_on_verification", True):
+            return False
+
+        if timeout_seconds is None:
+            timeout_seconds = self._anti_risk_int("verification_poll_seconds", 8)
+        if timeout_seconds <= 0:
+            return await self._wait_if_verification(page, label)
+
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while True:
+            if await self._wait_if_verification(page, label):
+                return True
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(1, remaining))
+
+    async def _is_verification_page(self, page: Page) -> bool:
+        try:
+            title = (await page.title()).lower()
+            body_texts = [title]
+            for frame in page.frames:
+                try:
+                    if frame != page.main_frame:
+                        frame_element = await frame.frame_element()
+                        if not await frame_element.is_visible(timeout=1000):
+                            continue
+                    frame_text = await frame.evaluate(
+                        """
+                        () => {
+                            const visible = (el) => {
+                                const rect = el.getBoundingClientRect();
+                                const style = window.getComputedStyle(el);
+                                return rect.width > 0 && rect.height > 0 &&
+                                    style.visibility !== 'hidden' &&
+                                    style.display !== 'none' &&
+                                    Number(style.opacity || 1) > 0;
+                            };
+                            const texts = [];
+                            const visit = (root) => {
+                                if (!root) return;
+                                for (const el of Array.from(root.querySelectorAll('*'))) {
+                                    if (!visible(el)) continue;
+                                    const ownText = Array.from(el.childNodes)
+                                        .filter((node) => node.nodeType === Node.TEXT_NODE)
+                                        .map((node) => node.textContent || '')
+                                        .join(' ');
+                                    const attrs = [
+                                        el.getAttribute('aria-label') || '',
+                                        el.getAttribute('title') || '',
+                                        el.getAttribute('placeholder') || '',
+                                        el.getAttribute('alt') || ''
+                                    ].join(' ');
+                                    if (ownText || attrs) texts.push(`${ownText} ${attrs}`);
+                                    if (el.shadowRoot) visit(el.shadowRoot);
+                                }
+                            };
+                            if (document.body) {
+                                texts.push(document.body.innerText || '');
+                                visit(document.body);
+                            }
+                            return texts.join('\\n').slice(0, 12000);
+                        }
+                        """
+                    )
+                    if frame_text:
+                        body_texts.append(str(frame_text))
+                except Exception:
+                    continue
+
+            text = "\n".join(body_texts).lower()
+            normalized_text = re.sub(r"[\s,，。:：;；>]+", "", text)
+            normalized_text = re.sub(r"[\s,.:;>\u3002\uff0c\uff1a\uff1b]+", "", text)
+            if any(marker in text or marker in normalized_text for marker in self.VERIFICATION_TEXT_MARKERS):
+                return True
+
+            for frame in page.frames:
+                try:
+                    if await frame.evaluate(self._verification_structure_script()):
+                        return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
+            return False
+
+    def _verification_structure_script(self) -> str:
+        return """
+        () => {
+            const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+            const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+            if (!viewportWidth || !viewportHeight) return false;
+
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' &&
+                    style.display !== 'none' &&
+                    Number(style.opacity || 1) > 0;
+            };
+            const rectOf = (el) => el.getBoundingClientRect();
+            const elements = Array.from(document.querySelectorAll('body *')).filter(visible);
+
+            const hasBlockingOverlay = elements.some((el) => {
+                const rect = rectOf(el);
+                const style = window.getComputedStyle(el);
+                const coversViewport =
+                    rect.width >= viewportWidth * 0.75 &&
+                    rect.height >= viewportHeight * 0.75 &&
+                    rect.left <= viewportWidth * 0.15 &&
+                    rect.top <= viewportHeight * 0.15;
+                const fixedLike = style.position === 'fixed' || style.position === 'sticky';
+                const bg = style.backgroundColor || '';
+                const hasDimBg = /rgba\\([^,]+,[^,]+,[^,]+,\\s*(0\\.[2-9]|1)/.test(bg);
+                return coversViewport && (fixedLike || hasDimBg);
+            });
+            if (!hasBlockingOverlay) return false;
+
+            const hasCenteredDialog = elements.some((el) => {
+                const rect = rectOf(el);
+                const style = window.getComputedStyle(el);
+                const centerX = rect.left + rect.width / 2;
+                const centerY = rect.top + rect.height / 2;
+                const centered =
+                    Math.abs(centerX - viewportWidth / 2) < viewportWidth * 0.22 &&
+                    Math.abs(centerY - viewportHeight / 2) < viewportHeight * 0.28;
+                const dialogSized =
+                    rect.width >= 280 && rect.width <= viewportWidth * 0.8 &&
+                    rect.height >= 180 && rect.height <= viewportHeight * 0.8;
+                const bg = style.backgroundColor || '';
+                const whiteLike =
+                    /rgb\\(\\s*2[3-5]\\d\\s*,\\s*2[3-5]\\d\\s*,\\s*2[3-5]\\d\\s*\\)/.test(bg) ||
+                    /rgba\\(\\s*2[3-5]\\d\\s*,\\s*2[3-5]\\d\\s*,\\s*2[3-5]\\d\\s*,\\s*(0\\.[8-9]|1)/.test(bg);
+                const rounded = Number.parseFloat(style.borderRadius || '0') >= 8;
+                return centered && dialogSized && (whiteLike || rounded);
+            });
+            if (!hasCenteredDialog) return false;
+
+            const sliderTracks = elements.filter((el) => {
+                const rect = rectOf(el);
+                const style = window.getComputedStyle(el);
+                const radius = Number.parseFloat(style.borderRadius || '0') || 0;
+                const horizontalTrack =
+                    rect.width >= 180 && rect.width <= 600 &&
+                    rect.height >= 24 && rect.height <= 80 &&
+                    rect.width / Math.max(rect.height, 1) >= 4;
+                const rounded = radius >= Math.min(rect.height / 3, 12);
+                return horizontalTrack && rounded;
+            });
+
+            return sliderTracks.some((track) => {
+                const trackRect = rectOf(track);
+                return elements.some((el) => {
+                    if (el === track) return false;
+                    const rect = rectOf(el);
+                    const nearLeft = rect.left >= trackRect.left - 8 && rect.left <= trackRect.left + trackRect.width * 0.25;
+                    const verticallyInside =
+                        rect.top >= trackRect.top - 12 &&
+                        rect.bottom <= trackRect.bottom + 12;
+                    const handleSized =
+                        rect.width >= 24 && rect.width <= 80 &&
+                        rect.height >= 24 && rect.height <= 80;
+                    return nearLeft && verticallyInside && handleSized;
+                });
+            });
+        }
+        """
 
     def _title_matches_search(self, title: str, keyword: str) -> bool:
         normalized_title = self._normalize_title(title)
@@ -525,7 +982,14 @@ class BaseAgent:
                 deduped[key] = listing
 
         rows = [
-            {"title": listing.title, "price": listing.price, "url": listing.url}
+            {
+                "title": listing.title,
+                "price": listing.price,
+                "url": listing.url,
+                "judgment": getattr(listing, "judgment", ""),
+                "spec_capture_mode": getattr(listing, "spec_capture_mode", ""),
+                "spec_capture_info": getattr(listing, "spec_capture_info", ""),
+            }
             for listing in deduped.values()
         ]
         save_listing_table(rows, path)

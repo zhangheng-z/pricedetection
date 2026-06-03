@@ -42,6 +42,9 @@ class AntiRiskConfig(BaseModel):
     max_pages_per_keyword: int = 5
     max_detail_clicks_per_keyword: int = 5
     max_detail_clicks_per_run: int = 8
+    verification_poll_seconds: int = 8
+    headless_verification_min_visible_seconds: int = 45
+    headless_verification_clear_settle_seconds: int = 5
     open_detail_in_new_page: bool = False
 
 

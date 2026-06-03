@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import platform
 import os
 import sys
@@ -92,6 +93,8 @@ async def main():
     parser.add_argument("--no-humanize", action="store_true", help="CloakBrowser only: disable human behavior patching.")
     parser.add_argument("--human-preset", default="careful", choices=["default", "careful"])
     parser.add_argument("--binary-path", default="", help="CloakBrowser only: local chrome.exe/msedge.exe path.")
+    parser.add_argument("--wait-file", default="", help="If set, wait until this file exists instead of waiting for Enter.")
+    parser.add_argument("--result-file", default="", help="Optional JSON result file to write success/error details.")
     args = parser.parse_args()
 
     if args.backend == "cloakbrowser" and not args.binary_path:
@@ -114,8 +117,16 @@ async def main():
         print(f"Browser opened with backend: {args.backend}")
         print("1. Log in manually in the opened browser.")
         print("2. Confirm the page shows your logged-in account.")
-        print("3. Return to this terminal and press Enter.")
-        input("Press Enter after login is complete...")
+        if args.wait_file:
+            wait_file = Path(args.wait_file)
+            wait_file.parent.mkdir(parents=True, exist_ok=True)
+            print(f"3. Return to the desktop app and click the confirm/save button.")
+            print(f"Waiting for signal file: {wait_file}")
+            while not wait_file.exists():
+                await asyncio.sleep(0.5)
+        else:
+            print("3. Return to this terminal and press Enter.")
+            input("Press Enter after login is complete...")
 
         state = await context.storage_state(path=str(output))
         print(f"Saved cookies: {len(state.get('cookies', []))}")
@@ -124,7 +135,33 @@ async def main():
 
     print(f"Storage state saved: {output}")
     print(f"Persistent profile saved: {user_data_dir}")
+    if args.result_file:
+        Path(args.result_file).write_text(
+            json.dumps(
+                {
+                    "ok": True,
+                    "storage_state": str(output),
+                    "user_data_dir": str(user_data_dir),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as exc:
+        argv = sys.argv[1:]
+        result_file = ""
+        for index, arg in enumerate(argv):
+            if arg == "--result-file" and index + 1 < len(argv):
+                result_file = argv[index + 1]
+                break
+        if result_file:
+            Path(result_file).write_text(
+                json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        raise

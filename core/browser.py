@@ -211,7 +211,11 @@ class BrowserManager:
         if not path.exists():
             return
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            raw_text = path.read_text(encoding="utf-8").strip()
+            if not raw_text:
+                print(f"[browser] skip empty storage_state file: {path}", flush=True)
+                return
+            data = json.loads(raw_text)
             cookies = data.get("cookies") or []
             if cookies:
                 await self._context.add_cookies(cookies)
@@ -267,3 +271,10 @@ class BrowserManager:
                 cookies = json.load(f)
             if self._context:
                 await self._context.add_cookies(cookies)
+
+    async def save_storage_state(self, file_path: str):
+        if not self._context:
+            raise RuntimeError("Browser context is not started.")
+        path = Path(file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        await self._context.storage_state(path=str(path))
