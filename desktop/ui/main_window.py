@@ -36,10 +36,17 @@ class MainWindow(QMainWindow):
     result_details_requested = Signal(int)
     open_login_requested = Signal(str)
     save_login_state_requested = Signal(str)
+    fishing_refresh_requested = Signal()
+    fishing_start_requested = Signal(int)
+    fishing_open_listing_requested = Signal(int)
+    fishing_messages_requested = Signal(int)
+    fishing_status_update_requested = Signal(int, str)
+    fishing_delete_requested = Signal(int)
 
     def __init__(self):
         super().__init__()
         self._accounts = []
+        self._fishing_alerts = []
         self._login_session_active = False
         self.setWindowTitle("Price Detection Desktop")
         self.resize(1220, 860)
@@ -62,6 +69,7 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget(self)
         tabs.addTab(self._build_run_tab(), "运行")
+        tabs.addTab(self._build_fishing_tab(), "询价跟进")
         tabs.addTab(self._build_config_tab(), "配置")
         layout.addWidget(tabs)
 
@@ -239,6 +247,58 @@ class MainWindow(QMainWindow):
         self.results_table.cellDoubleClicked.connect(lambda row, _column: self.result_details_requested.emit(row))
         return panel
 
+    def _build_fishing_tab(self) -> QWidget:
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setSpacing(12)
+
+        actions = QHBoxLayout()
+        self.fishing_refresh_button = QPushButton("刷新线索", page)
+        self.fishing_messages_button = QPushButton("查看会话", page)
+        self.fishing_status_combo = QComboBox(page)
+        self.fishing_status_combo.addItems(["pending", "fishing", "manual_required", "failed", "resolved"])
+        self.fishing_update_status_button = QPushButton("更新状态", page)
+        self.fishing_delete_button = QPushButton("删除商品", page)
+        actions.addWidget(self.fishing_refresh_button)
+        actions.addWidget(self.fishing_messages_button)
+        actions.addWidget(self.fishing_status_combo)
+        actions.addWidget(self.fishing_update_status_button)
+        actions.addWidget(self.fishing_delete_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        self.fishing_table = QTableWidget(0, 11, page)
+        self.fishing_table.setHorizontalHeaderLabels([
+            "序号",
+            "商品",
+            "标题",
+            "卖家",
+            "页面价",
+            "官方价",
+            "判断",
+            "状态",
+            "创建时间",
+            "商品链接",
+            "操作",
+        ])
+        self.fishing_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.fishing_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.fishing_table.verticalHeader().setVisible(False)
+        self.fishing_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.fishing_table)
+
+        self.fishing_log_output = QPlainTextEdit(page)
+        self.fishing_log_output.setReadOnly(True)
+        layout.addWidget(self.fishing_log_output)
+
+        self.fishing_refresh_button.clicked.connect(self.fishing_refresh_requested.emit)
+        self.fishing_messages_button.clicked.connect(self._emit_selected_fishing_messages)
+        self.fishing_update_status_button.clicked.connect(self._emit_selected_fishing_status_update)
+        self.fishing_delete_button.clicked.connect(self._emit_selected_fishing_delete)
+        self.fishing_table.itemSelectionChanged.connect(self._sync_fishing_buttons)
+        self._sync_fishing_buttons()
+        return page
+
     def _build_config_tab(self) -> QWidget:
         page = QWidget(self)
         layout = QVBoxLayout(page)
@@ -354,6 +414,8 @@ class MainWindow(QMainWindow):
     def append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_output.appendPlainText(f"[{timestamp}] {message}")
+        if hasattr(self, "fishing_log_output"):
+            self.fishing_log_output.appendPlainText(f"[{timestamp}] {message}")
 
     def clear_log(self) -> None:
         self.log_output.clear()
@@ -408,6 +470,41 @@ class MainWindow(QMainWindow):
             editor = self.config_editors.get(filename)
             if editor is not None:
                 editor.setPlainText(content)
+
+    def set_fishing_alerts(self, alerts: list[dict]) -> None:
+        self._fishing_alerts = alerts
+        self.fishing_table.setRowCount(len(alerts))
+        for row_index, alert in enumerate(alerts):
+            values = [
+                str(row_index + 1),
+                alert.get("product_name", ""),
+                alert.get("title", ""),
+                alert.get("seller_name", ""),
+                str(alert.get("price", "")),
+                str(alert.get("official_price", "")),
+                alert.get("judgment", ""),
+                alert.get("status", ""),
+                alert.get("created_at", ""),
+            ]
+            alert_id = int(alert.get("alert_id") or 0)
+            for column_index, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column_index == 0:
+                    item.setData(Qt.UserRole, alert_id)
+                self.fishing_table.setItem(row_index, column_index, item)
+
+            open_button = QPushButton("打开", self.fishing_table)
+            open_button.clicked.connect(
+                lambda _checked=False, row_alert_id=alert_id: self.fishing_open_listing_requested.emit(row_alert_id)
+            )
+            self.fishing_table.setCellWidget(row_index, 9, open_button)
+
+            start_button = QPushButton("发起询价", self.fishing_table)
+            start_button.clicked.connect(
+                lambda _checked=False, row_alert_id=alert_id: self.fishing_start_requested.emit(row_alert_id)
+            )
+            self.fishing_table.setCellWidget(row_index, 10, start_button)
+        self._sync_fishing_buttons()
 
     def _emit_start_requested(self) -> None:
         self.start_requested.emit(
@@ -516,3 +613,52 @@ class MainWindow(QMainWindow):
         item = self.account_table.item(row, 1)
         if item and item.text():
             self.open_account_storage_requested.emit(item.text())
+
+    def _selected_fishing_alert_id(self) -> int:
+        row = self.fishing_table.currentRow()
+        if row < 0:
+            return 0
+        item = self.fishing_table.item(row, 0)
+        if item is None:
+            return 0
+        alert_id = item.data(Qt.UserRole)
+        try:
+            return int(alert_id or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _sync_fishing_buttons(self) -> None:
+        has_alert = bool(self._selected_fishing_alert_id())
+        self.fishing_messages_button.setEnabled(has_alert)
+        self.fishing_update_status_button.setEnabled(has_alert)
+        self.fishing_delete_button.setEnabled(has_alert)
+        self.fishing_status_combo.setEnabled(has_alert)
+        if not has_alert:
+            return
+        status_item = self.fishing_table.item(self.fishing_table.currentRow(), 7)
+        status = status_item.text() if status_item else ""
+        index = self.fishing_status_combo.findText(status)
+        if index >= 0:
+            self.fishing_status_combo.setCurrentIndex(index)
+
+    def _emit_selected_fishing_messages(self) -> None:
+        alert_id = self._selected_fishing_alert_id()
+        if alert_id:
+            self.fishing_messages_requested.emit(alert_id)
+
+    def _emit_selected_fishing_status_update(self) -> None:
+        alert_id = self._selected_fishing_alert_id()
+        if alert_id:
+            self.fishing_status_update_requested.emit(alert_id, self.fishing_status_combo.currentText())
+
+    def _emit_selected_fishing_delete(self) -> None:
+        alert_id = self._selected_fishing_alert_id()
+        if not alert_id:
+            return
+        reply = QMessageBox.question(
+            self,
+            "删除商品",
+            "确定删除这条商品线索吗？相关询价会话记录也会一并删除。",
+        )
+        if reply == QMessageBox.Yes:
+            self.fishing_delete_requested.emit(alert_id)

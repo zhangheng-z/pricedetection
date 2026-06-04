@@ -239,6 +239,13 @@ class BaseAgent:
                 continue
             self.seen_urls.add(dedupe_key)
 
+            if url and self.db.listing_exists_by_url(url):
+                print(
+                    f"[{self.PLATFORM}] skip detail: already checked url {url}",
+                    flush=True,
+                )
+                continue
+
             if not self._can_open_detail(keyword):
                 print(
                     f"[{self.PLATFORM}] detail click limit reached for keyword: {keyword}",

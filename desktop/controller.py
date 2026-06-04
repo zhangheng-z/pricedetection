@@ -1,5 +1,6 @@
 import asyncio
 import os
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from PySide6.QtCore import QObject, Signal
 from reporter.judgment_labels import to_display_judgment
 from desktop.ui.main_window import MainWindow
 from services import MonitorService, RunOptions
+from services.fishing_service import FishingService
 
 
 class LogBridge(QObject):
@@ -19,8 +21,10 @@ class DesktopController:
         self.window = window
         self.log_bridge = LogBridge()
         self.service = MonitorService(log_callback=self.log_bridge.message.emit)
+        self.fishing_service = FishingService(log_callback=self.log_bridge.message.emit)
         self._last_summary = None
         self._run_task = None
+        self._fishing_task = None
 
     def bind(self) -> None:
         self.log_bridge.message.connect(self.window.append_log)
@@ -34,8 +38,15 @@ class DesktopController:
         self.window.result_details_requested.connect(self.show_result_details)
         self.window.open_login_requested.connect(self.open_login_browser)
         self.window.save_login_state_requested.connect(self.save_login_state)
+        self.window.fishing_refresh_requested.connect(self.refresh_fishing_alerts)
+        self.window.fishing_start_requested.connect(self.start_fishing)
+        self.window.fishing_open_listing_requested.connect(self.open_fishing_listing)
+        self.window.fishing_messages_requested.connect(self.show_fishing_messages)
+        self.window.fishing_status_update_requested.connect(self.update_fishing_status)
+        self.window.fishing_delete_requested.connect(self.delete_fishing_alert)
         self.load_runtime_config()
         self.load_config_documents()
+        self.refresh_fishing_alerts()
 
     def load_runtime_config(self) -> None:
         runtime = self.service.load_runtime_config()
@@ -216,3 +227,98 @@ class DesktopController:
             if account["id"] == account_id:
                 return account
         return None
+
+    def refresh_fishing_alerts(self) -> None:
+        try:
+            alerts = self.fishing_service.list_alerts(self._current_db_path())
+            self.window.set_fishing_alerts(alerts)
+            self.window.append_log(f"Fishing alerts loaded: {len(alerts)}")
+        except Exception as exc:
+            self.window.show_error(str(exc))
+
+    def start_fishing(self, alert_id: int) -> None:
+        if self._fishing_task and not self._fishing_task.done():
+            self.window.show_error("当前已有询价任务在运行。")
+            return
+        self._fishing_task = asyncio.create_task(self._start_fishing(alert_id))
+
+    async def _start_fishing(self, alert_id: int) -> None:
+        self.window.append_log(f"Starting fishing session for alert {alert_id}...")
+        try:
+            result = await self.fishing_service.start_fishing(
+                db_path=self._current_db_path(),
+                alert_id=alert_id,
+                auto_send=True,
+                headless=False,
+            )
+            self.window.append_log(
+                f"Fishing message sent for session {result.session_id}: {result.message}"
+            )
+            self.refresh_fishing_alerts()
+            self.window.append_log(
+                "Fishing session is running in the browser. "
+                "If no seller reply is detected, continue manually in the chat window."
+            )
+        except Exception as exc:
+            self.window.append_log(f"Fishing failed: {exc}")
+            self.refresh_fishing_alerts()
+            self.window.show_error(str(exc))
+        finally:
+            self._fishing_task = None
+
+    def open_fishing_listing(self, alert_id: int) -> None:
+        alert = self._find_fishing_alert(alert_id)
+        if not alert or not alert.get("url"):
+            self.window.show_error(f"未找到商品链接: {alert_id}")
+            return
+        webbrowser.open(alert["url"])
+        self.window.append_log(f"Opened listing URL: {alert['url']}")
+
+    def show_fishing_messages(self, alert_id: int) -> None:
+        alert = self._find_fishing_alert(alert_id)
+        if not alert:
+            self.window.show_error(f"未找到询价线索: {alert_id}")
+            return
+        session_id = alert.get("latest_session_id")
+        if not session_id:
+            self.window.show_info("暂无会话", "这条线索还没有发起过询价。")
+            return
+
+        messages = self.fishing_service.list_messages(self._current_db_path(), int(session_id))
+        lines = [
+            f"线索: {alert.get('title', '')}",
+            f"会话 ID: {session_id}",
+            "",
+        ]
+        if not messages:
+            lines.append("暂无消息记录。")
+        for message in messages:
+            lines.append(
+                f"[{message.get('created_at', '')}] {message.get('sender', '')}: {message.get('content', '')}"
+            )
+        self.window.show_result_details("询价会话", "\n".join(lines))
+
+    def update_fishing_status(self, alert_id: int, status: str) -> None:
+        try:
+            self.fishing_service.update_alert_status(self._current_db_path(), alert_id, status)
+            self.window.append_log(f"Updated alert {alert_id} status to {status}.")
+            self.refresh_fishing_alerts()
+        except Exception as exc:
+            self.window.show_error(str(exc))
+
+    def delete_fishing_alert(self, alert_id: int) -> None:
+        try:
+            self.fishing_service.delete_alert(self._current_db_path(), alert_id)
+            self.window.append_log(f"Deleted alert {alert_id}.")
+            self.refresh_fishing_alerts()
+        except Exception as exc:
+            self.window.show_error(str(exc))
+
+    def _find_fishing_alert(self, alert_id: int):
+        for alert in self.fishing_service.list_alerts(self._current_db_path()):
+            if int(alert.get("alert_id") or 0) == int(alert_id):
+                return alert
+        return None
+
+    def _current_db_path(self) -> str:
+        return self.window.db_path_input.text().strip() or "data/price_monitor.db"

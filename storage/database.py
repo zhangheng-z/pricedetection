@@ -78,10 +78,42 @@ class Database:
                     created_at TEXT DEFAULT (datetime('now', 'localtime'))
                 );
 
+                CREATE TABLE IF NOT EXISTS fishing_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_id INTEGER NOT NULL,
+                    listing_id INTEGER NOT NULL,
+                    platform TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    status TEXT DEFAULT 'created',
+                    current_step TEXT DEFAULT '',
+                    error TEXT DEFAULT '',
+                    started_at TEXT DEFAULT (datetime('now', 'localtime')),
+                    finished_at TEXT DEFAULT '',
+                    FOREIGN KEY (alert_id) REFERENCES price_alerts(id),
+                    FOREIGN KEY (listing_id) REFERENCES listings(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS fishing_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    sender TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    raw_payload TEXT DEFAULT '',
+                    created_at TEXT DEFAULT (datetime('now', 'localtime')),
+                    FOREIGN KEY (session_id) REFERENCES fishing_sessions(id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_listings_platform ON listings(platform);
                 CREATE INDEX IF NOT EXISTS idx_listings_created ON listings(created_at);
                 CREATE INDEX IF NOT EXISTS idx_alerts_status ON price_alerts(status);
                 CREATE INDEX IF NOT EXISTS idx_runs_time ON search_runs(run_time);
+                CREATE INDEX IF NOT EXISTS idx_fishing_sessions_alert ON fishing_sessions(alert_id);
+                CREATE INDEX IF NOT EXISTS idx_fishing_messages_session ON fishing_messages(session_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_listings_url_unique
+                    ON listings(url)
+                    WHERE url != '';
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_price_alerts_listing_unique
+                    ON price_alerts(listing_id);
             """)
 
     def save_run(self, run: SearchRun) -> int:
@@ -98,19 +130,46 @@ class Database:
 
     def save_listing(self, listing: Listing) -> int:
         with self._get_conn() as conn:
-            cur = conn.execute(
-                """INSERT INTO listings (platform, product_name, title, price,
-                   seller_name, url, thumbnail, sales_count, search_keyword, search_run_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (listing.platform, listing.product_name, listing.title,
-                 listing.price, listing.seller_name, listing.url,
-                 listing.thumbnail, listing.sales_count,
-                 listing.search_keyword, listing.search_run_id),
-            )
-            return cur.lastrowid
+            try:
+                cur = conn.execute(
+                    """INSERT INTO listings (platform, product_name, title, price,
+                       seller_name, url, thumbnail, sales_count, search_keyword, search_run_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (listing.platform, listing.product_name, listing.title,
+                     listing.price, listing.seller_name, listing.url,
+                     listing.thumbnail, listing.sales_count,
+                     listing.search_keyword, listing.search_run_id),
+                )
+                return cur.lastrowid
+            except sqlite3.IntegrityError:
+                if not listing.url:
+                    raise
+                existing = conn.execute(
+                    "SELECT id FROM listings WHERE url = ?",
+                    (listing.url,),
+                ).fetchone()
+                if not existing:
+                    raise
+                return int(existing["id"])
 
     def save_alert(self, alert: PriceAlert) -> int:
         with self._get_conn() as conn:
+            existing = conn.execute(
+                "SELECT id FROM price_alerts WHERE listing_id = ?",
+                (alert.listing_id,),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """UPDATE price_alerts
+                       SET platform = ?, product_name = ?, title = ?, price = ?,
+                           official_price = ?, judgment = ?, reason = ?, status = ?
+                       WHERE id = ?""",
+                    (alert.platform, alert.product_name, alert.title, alert.price,
+                     alert.official_price, alert.judgment, alert.reason, alert.status,
+                     existing["id"]),
+                )
+                return int(existing["id"])
+
             cur = conn.execute(
                 """INSERT INTO price_alerts (listing_id, platform, product_name,
                    title, price, official_price, judgment, reason, status)
@@ -157,3 +216,228 @@ class Database:
                 "total": total,
                 "by_product": {r["product_name"]: r["c"] for r in by_product},
             }
+
+    def list_fishable_alerts(self) -> List[dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    a.id AS alert_id,
+                    a.listing_id,
+                    a.platform,
+                    a.product_name,
+                    a.title,
+                    a.price,
+                    a.official_price,
+                    a.judgment,
+                    a.reason,
+                    a.status,
+                    a.created_at,
+                    l.seller_name,
+                    l.url,
+                    l.thumbnail,
+                    (
+                        SELECT fs.id
+                        FROM fishing_sessions fs
+                        WHERE fs.alert_id = a.id
+                        ORDER BY fs.id DESC
+                        LIMIT 1
+                    ) AS latest_session_id
+                FROM price_alerts a
+                JOIN listings l ON l.id = a.listing_id
+                WHERE a.platform = 'xianyu'
+                  AND a.status IN ('pending', 'fishing', 'manual_required', 'failed')
+                  AND a.judgment IN ('VIOLATION', 'SUSPECTED', 'DELIST', 'REVIEW')
+                ORDER BY
+                    CASE a.product_name
+                        WHEN '适趣 AI 中文15天' THEN 1
+                        WHEN '适趣 AI 中文年卡' THEN 2
+                        WHEN '适趣 AI 英文21天' THEN 3
+                        WHEN '适趣 AI 英文年卡' THEN 4
+                        ELSE 99
+                    END,
+                    a.price ASC,
+                    a.created_at DESC,
+                    a.id DESC
+                """
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def listing_exists_by_url(self, url: str) -> bool:
+        if not url:
+            return False
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM listings WHERE url = ? LIMIT 1",
+                (url,),
+            ).fetchone()
+            return row is not None
+
+    def get_listing_by_url(self, url: str) -> Optional[dict]:
+        if not url:
+            return None
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM listings WHERE url = ? LIMIT 1",
+                (url,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def update_alert_judgment_by_url(self, url: str, judgment: str, reason: str = "") -> bool:
+        if not url:
+            return False
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE price_alerts
+                SET judgment = ?, reason = ?, status = 'pending'
+                WHERE listing_id IN (
+                    SELECT id FROM listings WHERE url = ?
+                )
+                """,
+                (judgment, reason, url),
+            )
+            return cur.rowcount > 0
+
+    def delete_alert_by_url(self, url: str) -> bool:
+        if not url:
+            return False
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM price_alerts
+                WHERE listing_id IN (
+                    SELECT id FROM listings WHERE url = ?
+                )
+                """,
+                (url,),
+            )
+            return cur.rowcount > 0
+
+    def clear_business_data(self) -> None:
+        with self._get_conn() as conn:
+            conn.executescript(
+                """
+                DELETE FROM fishing_messages;
+                DELETE FROM fishing_sessions;
+                DELETE FROM price_alerts;
+                DELETE FROM listings;
+                DELETE FROM search_runs;
+                DELETE FROM daily_reports;
+                """
+            )
+
+    def get_fishing_alert(self, alert_id: int) -> Optional[dict]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    a.id AS alert_id,
+                    a.listing_id,
+                    a.platform,
+                    a.product_name,
+                    a.title,
+                    a.price,
+                    a.official_price,
+                    a.judgment,
+                    a.reason,
+                    a.status,
+                    l.seller_name,
+                    l.url,
+                    l.thumbnail
+                FROM price_alerts a
+                JOIN listings l ON l.id = a.listing_id
+                WHERE a.id = ?
+                """,
+                (alert_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def create_fishing_session(self, alert_id: int, listing_id: int, platform: str, account_id: str) -> int:
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO fishing_sessions (alert_id, listing_id, platform, account_id, status, current_step)
+                VALUES (?, ?, ?, ?, 'created', 'created')
+                """,
+                (alert_id, listing_id, platform, account_id),
+            )
+            return cur.lastrowid
+
+    def save_fishing_message(self, session_id: int, sender: str, content: str, raw_payload: str = "") -> int:
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO fishing_messages (session_id, sender, content, raw_payload)
+                VALUES (?, ?, ?, ?)
+                """,
+                (session_id, sender, content, raw_payload),
+            )
+            return cur.lastrowid
+
+    def list_fishing_messages(self, session_id: int) -> List[dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, session_id, sender, content, raw_payload, created_at
+                FROM fishing_messages
+                WHERE session_id = ?
+                ORDER BY id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def delete_alert(self, alert_id: int) -> bool:
+        with self._get_conn() as conn:
+            session_rows = conn.execute(
+                "SELECT id FROM fishing_sessions WHERE alert_id = ?",
+                (alert_id,),
+            ).fetchall()
+            session_ids = [int(row["id"]) for row in session_rows]
+            if session_ids:
+                placeholders = ",".join("?" for _ in session_ids)
+                conn.execute(
+                    f"DELETE FROM fishing_messages WHERE session_id IN ({placeholders})",
+                    session_ids,
+                )
+            conn.execute("DELETE FROM fishing_sessions WHERE alert_id = ?", (alert_id,))
+            cur = conn.execute("DELETE FROM price_alerts WHERE id = ?", (alert_id,))
+            return cur.rowcount > 0
+
+    def update_alert_status(self, alert_id: int, status: str) -> bool:
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                "UPDATE price_alerts SET status = ? WHERE id = ?",
+                (status, alert_id),
+            )
+            return cur.rowcount > 0
+
+    def update_fishing_session_status(
+        self,
+        session_id: int,
+        status: str,
+        current_step: str = "",
+        error: str = "",
+        finished: bool = False,
+    ) -> None:
+        finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if finished else ""
+        with self._get_conn() as conn:
+            if finished:
+                conn.execute(
+                    """
+                    UPDATE fishing_sessions
+                    SET status = ?, current_step = ?, error = ?, finished_at = ?
+                    WHERE id = ?
+                    """,
+                    (status, current_step, error, finished_at, session_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE fishing_sessions
+                    SET status = ?, current_step = ?, error = ?
+                    WHERE id = ?
+                    """,
+                    (status, current_step, error, session_id),
+                )

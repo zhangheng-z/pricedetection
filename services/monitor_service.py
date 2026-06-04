@@ -372,7 +372,7 @@ class MonitorService:
                 review_results_file, review_payload = self._save_review_results(run_results, llm)
                 if review_results_file:
                     print(f"Review results file: {review_results_file}")
-                self._apply_review_results(run_results, review_payload)
+                self._apply_review_results(run_results, review_payload, db)
             deduped_results_file = self._save_deduped_run_results(run_results)
             if deduped_results_file:
                 print(f"Deduped run results file: {deduped_results_file}")
@@ -592,7 +592,12 @@ class MonitorService:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return (str(path), payload)
 
-    def _apply_review_results(self, run_results: List[ProductRunResult], review_payload: Dict[str, Any]) -> None:
+    def _apply_review_results(
+        self,
+        run_results: List[ProductRunResult],
+        review_payload: Dict[str, Any],
+        db: Database,
+    ) -> None:
         if not review_payload:
             return
 
@@ -629,10 +634,20 @@ class MonitorService:
                 if not decision:
                     continue
 
-                item["judgment"] = str(decision.get("decision", item.get("judgment", ""))).upper()
+                final_decision = str(decision.get("decision", item.get("judgment", ""))).upper()
+                review_reason = str(decision.get("reason", ""))
+                item["judgment"] = final_decision
                 item["review_sku"] = decision.get("sku", "")
-                item["review_reason"] = decision.get("reason", "")
+                item["review_reason"] = review_reason
                 item["review_confidence"] = decision.get("confidence", "")
+
+                if not url:
+                    continue
+                if final_decision == "NORMAL":
+                    db.delete_alert_by_url(url)
+                    continue
+                if final_decision in {"VIOLATION", "SUSPECTED", "DELIST", "REVIEW"}:
+                    db.update_alert_judgment_by_url(url, final_decision, review_reason)
 
     def _result_to_dict(self, result: ProductRunResult) -> dict:
         return {

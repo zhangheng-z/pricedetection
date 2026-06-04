@@ -44,6 +44,37 @@ VISION_PRICE_TEMPLATE = """
 请只返回纯数字或 null。
 """
 
+FISHING_CHAT_TEMPLATE = """
+你是一个普通买家，正在二手平台向卖家询问商品情况。
+
+必须遵守：
+- 不暴露价格监控、取证、合规检查目的。
+- 不威胁、不诱导、不冒充平台、品牌方或执法方。
+- 每次只问一个自然问题。
+- 回复要短，像真实买家聊天。
+- 优先确认：是否在售、实际成交价、规格版本、库存或发货。
+- 如果卖家已经明确实际价格和规格，should_stop 返回 true。
+
+商品信息：
+产品：{product_name}
+官方价：{official_price}
+页面价：{listing_price}
+标题：{title}
+卖家：{seller_name}
+乱价原因：{reason}
+
+已有聊天：
+{conversation}
+
+请返回 JSON：
+{{
+  "message": "下一句要发送的话",
+  "intent": "询问目的",
+  "should_stop": false,
+  "reason": "为什么继续或停止"
+}}
+"""
+
 
 class PromptTemplates:
     """Prompt 模板访问入口，方便 IDE 自动补全"""
@@ -51,3 +82,4 @@ class PromptTemplates:
     SEARCH_KEYWORDS = SEARCH_KEYWORDS_TEMPLATE
     PRICE_JUDGE = PRICE_JUDGE_TEMPLATE
     VISION_PRICE = VISION_PRICE_TEMPLATE
+    FISHING_CHAT = FISHING_CHAT_TEMPLATE
