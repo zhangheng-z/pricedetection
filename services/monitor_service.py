@@ -100,7 +100,8 @@ class _StdoutTee(io.TextIOBase):
         self._buffer = ""
 
     def write(self, text: str) -> int:
-        self.original.write(text)
+        if self.original is not None:
+            self.original.write(text)
         if self.callback:
             self._buffer += text
             while "\n" in self._buffer:
@@ -110,7 +111,8 @@ class _StdoutTee(io.TextIOBase):
         return len(text)
 
     def flush(self) -> None:
-        self.original.flush()
+        if self.original is not None:
+            self.original.flush()
         if self.callback and self._buffer:
             self.callback(self._buffer)
             self._buffer = ""
@@ -158,6 +160,30 @@ class MonitorService:
         path.write_text(content, encoding="utf-8")
         self.load_runtime_config()
 
+    def save_llm_config(self, llm_config: dict) -> None:
+        path = self.config_loader.config_dir / "settings.yaml"
+        raw_settings = ""
+        if path.exists():
+            raw_settings = path.read_text(encoding="utf-8")
+
+        llm_block = yaml.safe_dump(
+            {
+                "llm": {
+                    "provider": llm_config["provider"],
+                    "model": llm_config["model"],
+                    "api_key": llm_config["api_key"],
+                    "api_base": llm_config["api_base"],
+                    "temperature": float(llm_config["temperature"]),
+                }
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        )
+        updated_settings = self._replace_top_level_yaml_block(raw_settings, "llm", llm_block)
+        yaml.safe_load(updated_settings or "")
+        path.write_text(updated_settings, encoding="utf-8")
+        self.load_runtime_config()
+
     def list_accounts(self) -> List[dict]:
         config = self.load_runtime_config()
         accounts: List[AccountConfig] = config["accounts"]
@@ -194,17 +220,11 @@ class MonitorService:
 
         user_data_dir = Path(account.user_data_dir or f"data/browser_profiles/{account.id}")
         storage_state = Path(account.storage_state or f"data/auth/{account.id}.json")
-        login_session_dir = self.config_loader.project_dir / "data" / "login_sessions"
+        runtime_dir = self._runtime_dir()
+        login_session_dir = runtime_dir / "data" / "login_sessions"
         user_data_dir.mkdir(parents=True, exist_ok=True)
         storage_state.parent.mkdir(parents=True, exist_ok=True)
         login_session_dir.mkdir(parents=True, exist_ok=True)
-
-        python_path = self.config_loader.project_dir / "venv" / "Scripts" / "python.exe"
-        script_path = self.config_loader.project_dir / "scripts" / "save_login_state.py"
-        if not python_path.exists():
-            raise FileNotFoundError(f"Python interpreter not found: {python_path}")
-        if not script_path.exists():
-            raise FileNotFoundError(f"Login script not found: {script_path}")
 
         session_id = uuid.uuid4().hex
         wait_file = login_session_dir / f"{account.id}_{session_id}.signal"
@@ -215,8 +235,7 @@ class MonitorService:
             result_file.unlink()
 
         command = [
-            str(python_path),
-            str(script_path),
+            *self._login_helper_command(),
             "--platform",
             account.platform,
             "--account",
@@ -228,7 +247,7 @@ class MonitorService:
         ]
         process = subprocess.Popen(
             command,
-            cwd=str(self.config_loader.project_dir),
+            cwd=str(runtime_dir),
         )
 
         self._login_session = LoginSession(
@@ -670,6 +689,46 @@ class MonitorService:
 
     def _has_usable_storage_state(self, path: Path) -> bool:
         return path.exists() and path.stat().st_size > 0
+
+    def _replace_top_level_yaml_block(self, content: str, key: str, replacement: str) -> str:
+        lines = content.splitlines()
+        start = None
+        for index, line in enumerate(lines):
+            if line == f"{key}:":
+                start = index
+                break
+
+        if start is None:
+            prefix = content.rstrip()
+            return f"{replacement}\n" if not prefix else f"{replacement}\n{prefix}\n"
+
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            line = lines[index]
+            if line and not line.startswith((" ", "\t", "#")):
+                end = index
+                break
+
+        replacement_lines = replacement.rstrip().splitlines()
+        updated_lines = lines[:start] + replacement_lines + lines[end:]
+        return "\n".join(updated_lines).rstrip() + "\n"
+
+    def _runtime_dir(self) -> Path:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent
+        return self.config_loader.project_dir
+
+    def _login_helper_command(self) -> List[str]:
+        if getattr(sys, "frozen", False):
+            return [sys.executable, "--login-helper"]
+
+        python_path = self.config_loader.project_dir / "venv" / "Scripts" / "python.exe"
+        script_path = self.config_loader.project_dir / "scripts" / "save_login_state.py"
+        if not python_path.exists():
+            raise FileNotFoundError(f"Python interpreter not found: {python_path}")
+        if not script_path.exists():
+            raise FileNotFoundError(f"Login script not found: {script_path}")
+        return [str(python_path), str(script_path)]
 
     def _cleanup_login_session_files(self, session: LoginSession) -> None:
         for file_path in (session.wait_file, session.result_file):

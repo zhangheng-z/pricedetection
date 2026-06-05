@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -23,6 +24,41 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+import yaml
+
+
+LLM_PRESETS = {
+    "DashScope / Qwen": {
+        "provider": "openai_compatible",
+        "model": "qwen3.6-plus",
+        "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "api_key": "${DASHSCOPE_API_KEY}",
+    },
+    "DeepSeek": {
+        "provider": "openai_compatible",
+        "model": "deepseek-chat",
+        "api_base": "https://api.deepseek.com/v1",
+        "api_key": "${DEEPSEEK_API_KEY}",
+    },
+    "OpenAI / GPT": {
+        "provider": "openai_compatible",
+        "model": "gpt-4o-mini",
+        "api_base": "https://api.openai.com/v1",
+        "api_key": "${OPENAI_API_KEY}",
+    },
+    "Anthropic / Claude": {
+        "provider": "anthropic",
+        "model": "claude-3-5-sonnet-latest",
+        "api_base": "",
+        "api_key": "${ANTHROPIC_API_KEY}",
+    },
+    "自定义 OpenAI-compatible": {
+        "provider": "openai_compatible",
+        "model": "",
+        "api_base": "",
+        "api_key": "",
+    },
+}
 
 
 class MainWindow(QMainWindow):
@@ -30,6 +66,7 @@ class MainWindow(QMainWindow):
     stop_requested = Signal()
     refresh_requested = Signal()
     save_config_requested = Signal(dict)
+    save_llm_config_requested = Signal(dict)
     open_file_requested = Signal(str)
     open_account_storage_requested = Signal(str)
     open_account_storage_dir_requested = Signal(str)
@@ -42,15 +79,22 @@ class MainWindow(QMainWindow):
     fishing_messages_requested = Signal(int)
     fishing_status_update_requested = Signal(int, str)
     fishing_delete_requested = Signal(int)
+    fishing_batch_start_requested = Signal(list)
+    fishing_batch_stop_requested = Signal()
 
     def __init__(self):
         super().__init__()
         self._accounts = []
         self._fishing_alerts = []
+        self._fishing_batch_running = False
         self._login_session_active = False
         self.setWindowTitle("Price Detection Desktop")
-        self.resize(1220, 860)
+        self.resize(1180, 720)
         self._build_ui()
+        self._localize_text()
+        self._apply_styles()
+        self._style_tables()
+        self._set_button_roles()
         self._set_output_button(self.open_deduped_button, "")
         self._set_output_button(self.open_report_button, "")
         self._set_output_button(self.open_output_dir_button, "")
@@ -60,20 +104,274 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget(self)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
 
-        header = QLabel("桌面控制台")
-        header.setStyleSheet("font-size: 24px; font-weight: 600;")
+        header = QLabel("价格监控工作台")
+        header.setStyleSheet("font-size: 15pt; font-weight: 700; color: #0F172A;")
         layout.addWidget(header)
 
         tabs = QTabWidget(self)
         tabs.addTab(self._build_run_tab(), "运行")
         tabs.addTab(self._build_fishing_tab(), "询价跟进")
-        tabs.addTab(self._build_config_tab(), "配置")
         layout.addWidget(tabs)
 
         self.setCentralWidget(central)
+
+    def _localize_text(self) -> None:
+        self.setWindowTitle("价格监控工作台")
+
+        tabs = self.findChildren(QTabWidget)
+        if tabs:
+            tabs[0].setTabText(0, "监控运行")
+            tabs[0].setTabText(1, "询价跟进")
+
+        self.start_button.setText("开始运行")
+        self.stop_button.setText("停止任务")
+        self.refresh_button.setText("刷新配置")
+        self.headless_checkbox.setText("无头模式")
+        self.open_login_button.setText("打开登录窗口")
+        self.save_login_state_button.setText("完成登录并保存")
+        self.open_account_storage_button.setText("打开登录态文件")
+        self.open_account_storage_dir_button.setText("打开登录态目录")
+        self.open_deduped_button.setText("打开汇总结果")
+        self.open_report_button.setText("打开日报文件")
+        self.open_output_dir_button.setText("打开输出目录")
+
+        self.fishing_refresh_button.setText("刷新线索")
+        self.fishing_messages_button.setText("查看会话")
+        self.fishing_headless_checkbox.setText("无头模式")
+        self.fishing_update_status_button.setText("更新状态")
+        self.fishing_delete_button.setText("删除商品")
+        self.fishing_batch_start_button.setText("批量询价")
+        self.fishing_batch_stop_button.setText("停止批量")
+
+        if hasattr(self, "save_llm_config_button"):
+            self.save_llm_config_button.setText("保存模型配置")
+        if hasattr(self, "reload_llm_config_button"):
+            self.reload_llm_config_button.setText("重新加载")
+
+        self.account_table.setHorizontalHeaderLabels(["平台", "账号", "状态", "已保存", "最近保存时间", "存档路径"])
+        self.results_table.setHorizontalHeaderLabels(["平台", "商品", "账号", "采集数", "告警数"])
+        self.fishing_table.setHorizontalHeaderLabels([
+            "选择",
+            "序号",
+            "商品",
+            "标题",
+            "卖家",
+            "页面价",
+            "官方价",
+            "判断",
+            "状态",
+            "创建时间",
+            "商品链接",
+            "操作",
+        ])
+        self._set_status_label("空闲", "idle")
+
+    def _apply_styles(self) -> None:
+        self.setStyleSheet("""
+            QMainWindow, QWidget {
+                background: #F6F7F9;
+                color: #1F2937;
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimHei", "Segoe UI";
+                font-size: 9pt;
+            }
+            QTabWidget::pane {
+                border: 1px solid #E5E7EB;
+                border-radius: 8px;
+                background: #FFFFFF;
+                top: -1px;
+            }
+            QTabBar::tab {
+                background: transparent;
+                color: #64748B;
+                padding: 7px 16px;
+                margin-right: 4px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+            }
+            QTabBar::tab:selected {
+                background: #FFFFFF;
+                color: #0F766E;
+                font-weight: 600;
+                border: 1px solid #E5E7EB;
+                border-bottom-color: #FFFFFF;
+            }
+            QGroupBox {
+                background: #FFFFFF;
+                border: 1px solid #E5E7EB;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding: 10px 10px 8px 10px;
+                font-weight: 600;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                color: #0F172A;
+            }
+            QLineEdit, QComboBox, QDoubleSpinBox, QPlainTextEdit {
+                background: #FFFFFF;
+                border: 1px solid #D6DAE1;
+                border-radius: 6px;
+                padding: 4px 7px;
+                selection-background-color: #99F6E4;
+            }
+            QLineEdit:disabled {
+                background: #F1F5F9;
+                color: #64748B;
+                border-color: #D6DAE1;
+            }
+            QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QPlainTextEdit:focus {
+                border-color: #0F766E;
+            }
+            QPushButton {
+                min-height: 26px;
+                padding: 4px 10px;
+                border-radius: 6px;
+                border: 1px solid #CBD5E1;
+                background: #FFFFFF;
+                color: #334155;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background: #F8FAFC;
+                border-color: #94A3B8;
+            }
+            QPushButton:disabled {
+                color: #94A3B8;
+                background: #F1F5F9;
+                border-color: #E2E8F0;
+            }
+            QPushButton[role="primary"] {
+                background: #0F766E;
+                border-color: #0F766E;
+                color: #FFFFFF;
+                font-weight: 600;
+            }
+            QPushButton[role="primary"]:hover {
+                background: #115E59;
+                border-color: #115E59;
+            }
+            QPushButton[role="danger"] {
+                color: #B91C1C;
+                border-color: #FCA5A5;
+                background: #FFF7F7;
+            }
+            QPushButton[role="danger"]:hover {
+                background: #FEE2E2;
+            }
+            QPushButton[role="small"] {
+                min-height: 22px;
+                max-height: 22px;
+                padding: 2px 8px;
+                font-size: 8pt;
+                font-weight: 500;
+            }
+            QTableWidget {
+                background: #FFFFFF;
+                alternate-background-color: #F8FAFC;
+                gridline-color: #E5E7EB;
+                border: 1px solid #E5E7EB;
+                border-radius: 6px;
+            }
+            QHeaderView::section {
+                background: #F1F5F9;
+                color: #334155;
+                padding: 5px 6px;
+                border: 0;
+                border-right: 1px solid #E2E8F0;
+                font-weight: 600;
+            }
+            QTableWidget::item {
+                padding: 4px;
+            }
+            QTableWidget::item:hover {
+                background: transparent;
+                color: #1F2937;
+            }
+            QTableWidget::item:selected {
+                background: #F1F5F9;
+                color: #1F2937;
+            }
+            QTableWidget::item:selected:active {
+                background: #F1F5F9;
+                color: #1F2937;
+            }
+            QTableWidget::item:selected:!active {
+                background: #F1F5F9;
+                color: #1F2937;
+            }
+            QPlainTextEdit {
+                font-family: Consolas, "Microsoft YaHei UI", "Microsoft YaHei", "SimHei";
+                font-size: 8pt;
+            }
+            QLabel[state="idle"] {
+                color: #475569;
+                background: #F1F5F9;
+                border: 1px solid #E2E8F0;
+                border-radius: 11px;
+                padding: 3px 10px;
+                font-weight: 600;
+            }
+            QLabel[state="running"] {
+                color: #1D4ED8;
+                background: #EFF6FF;
+                border: 1px solid #BFDBFE;
+                border-radius: 11px;
+                padding: 3px 10px;
+                font-weight: 600;
+            }
+            QLabel[state="success"] {
+                color: #047857;
+                background: #ECFDF5;
+                border: 1px solid #A7F3D0;
+                border-radius: 11px;
+                padding: 3px 10px;
+                font-weight: 600;
+            }
+            QLabel[state="warning"] {
+                color: #B45309;
+                background: #FFFBEB;
+                border: 1px solid #FDE68A;
+                border-radius: 11px;
+                padding: 3px 10px;
+                font-weight: 600;
+            }
+        """)
+
+    def _style_tables(self) -> None:
+        for table in [self.account_table, self.results_table, self.fishing_table]:
+            table.setAlternatingRowColors(True)
+            table.verticalHeader().setDefaultSectionSize(28)
+            table.horizontalHeader().setHighlightSections(False)
+
+    def _set_button_roles(self) -> None:
+        roles = {
+            self.start_button: "primary",
+            self.fishing_batch_start_button: "primary",
+            self.stop_button: "danger",
+            self.fishing_delete_button: "danger",
+            self.fishing_batch_stop_button: "danger",
+        }
+        if hasattr(self, "save_llm_config_button"):
+            roles[self.save_llm_config_button] = "primary"
+        for button, role in roles.items():
+            button.setProperty("role", role)
+            self._refresh_widget_style(button)
+
+    def _set_status_label(self, text: str, state: str) -> None:
+        self.status_label.setText(text)
+        self.status_label.setProperty("state", state)
+        self.status_label.setFixedWidth(max(72, len(text) * 18))
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self._refresh_widget_style(self.status_label)
+
+    def _refresh_widget_style(self, widget: QWidget) -> None:
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
 
     def _build_run_tab(self) -> QWidget:
         page = QWidget(self)
@@ -96,16 +394,13 @@ class MainWindow(QMainWindow):
         run_group = QGroupBox("运行参数", panel)
         run_form = QFormLayout(run_group)
         self.platform_combo = QComboBox(run_group)
-        self.platform_combo.addItem("all")
+        self.platform_combo.addItem("xianyu")
         run_form.addRow("平台", self.platform_combo)
         self.db_path_input = QLineEdit("data/price_monitor.db", run_group)
+        self.db_path_input.setEnabled(False)
         run_form.addRow("数据库", self.db_path_input)
         self.headless_checkbox = QCheckBox("无头模式", run_group)
-        self.debug_fast_checkbox = QCheckBox("调试加速", run_group)
-        self.dry_run_checkbox = QCheckBox("仅 dry-run", run_group)
         run_form.addRow("", self.headless_checkbox)
-        run_form.addRow("", self.debug_fast_checkbox)
-        run_form.addRow("", self.dry_run_checkbox)
         layout.addWidget(run_group)
 
         runtime_group = QGroupBox("运行时信息", panel)
@@ -113,14 +408,20 @@ class MainWindow(QMainWindow):
         self.provider_label = QLabel("-", runtime_group)
         self.products_label = QLabel("-", runtime_group)
         self.accounts_label = QLabel("-", runtime_group)
+        self.token_usage_label = QLabel("-", runtime_group)
         self.products_label.setWordWrap(True)
         self.accounts_label.setWordWrap(True)
+        self.token_usage_label.setWordWrap(True)
+        self.products_label.setMaximumHeight(36)
+        self.accounts_label.setMaximumHeight(36)
         runtime_layout.addWidget(QLabel("模型", runtime_group))
         runtime_layout.addWidget(self.provider_label)
         runtime_layout.addWidget(QLabel("商品", runtime_group))
         runtime_layout.addWidget(self.products_label)
         runtime_layout.addWidget(QLabel("账号", runtime_group))
         runtime_layout.addWidget(self.accounts_label)
+        runtime_layout.addWidget(QLabel("Token", runtime_group))
+        runtime_layout.addWidget(self.token_usage_label)
         layout.addWidget(runtime_group)
 
         login_group = QGroupBox("账号登录", panel)
@@ -132,6 +433,7 @@ class MainWindow(QMainWindow):
 
         login_hint = QLabel("点击“打开登录窗口”后在浏览器里完成登录，再回到这里点击“完成登录并保存”。", login_group)
         login_hint.setWordWrap(True)
+        login_hint.setMaximumHeight(42)
         login_form.addRow("", login_hint)
 
         login_actions = QHBoxLayout()
@@ -150,6 +452,7 @@ class MainWindow(QMainWindow):
         self.account_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.account_table.verticalHeader().setVisible(False)
         self.account_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.account_table.setMaximumHeight(120)
         account_layout.addWidget(self.account_table)
 
         account_actions = QHBoxLayout()
@@ -187,26 +490,24 @@ class MainWindow(QMainWindow):
     def _build_output_panel(self) -> QWidget:
         panel = QWidget(self)
         layout = QVBoxLayout(panel)
-        layout.setSpacing(12)
+        layout.setSpacing(8)
 
         summary_group = QGroupBox("运行摘要", panel)
-        summary_layout = QVBoxLayout(summary_group)
+        summary_layout = QFormLayout(summary_group)
+        summary_layout.setLabelAlignment(Qt.AlignRight)
+        summary_layout.setHorizontalSpacing(12)
+        summary_layout.setVerticalSpacing(6)
         self.status_label = QLabel("空闲", summary_group)
         self.started_label = QLabel("-", summary_group)
         self.finished_label = QLabel("-", summary_group)
         self.totals_label = QLabel("-", summary_group)
         self.report_label = QLabel("-", summary_group)
         self.report_label.setWordWrap(True)
-        summary_layout.addWidget(QLabel("状态", summary_group))
-        summary_layout.addWidget(self.status_label)
-        summary_layout.addWidget(QLabel("开始时间", summary_group))
-        summary_layout.addWidget(self.started_label)
-        summary_layout.addWidget(QLabel("结束时间", summary_group))
-        summary_layout.addWidget(self.finished_label)
-        summary_layout.addWidget(QLabel("统计", summary_group))
-        summary_layout.addWidget(self.totals_label)
-        summary_layout.addWidget(QLabel("输出文件", summary_group))
-        summary_layout.addWidget(self.report_label)
+        summary_layout.addRow("状态", self.status_label)
+        summary_layout.addRow("开始时间", self.started_label)
+        summary_layout.addRow("结束时间", self.finished_label)
+        summary_layout.addRow("统计", self.totals_label)
+        summary_layout.addRow("输出文件", self.report_label)
 
         output_actions = QHBoxLayout()
         self.open_deduped_button = QPushButton("打开汇总结果", summary_group)
@@ -215,7 +516,8 @@ class MainWindow(QMainWindow):
         output_actions.addWidget(self.open_deduped_button)
         output_actions.addWidget(self.open_report_button)
         output_actions.addWidget(self.open_output_dir_button)
-        summary_layout.addLayout(output_actions)
+        summary_layout.addRow("", self._wrap_layout(output_actions, summary_group))
+        summary_group.setMaximumHeight(190)
         layout.addWidget(summary_group)
 
         result_group = QGroupBox("本次结果", panel)
@@ -225,13 +527,15 @@ class MainWindow(QMainWindow):
         self.results_table.horizontalHeader().setStretchLastSection(True)
         self.results_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.results_table.setMinimumHeight(160)
         result_layout.addWidget(self.results_table)
-        layout.addWidget(result_group)
+        layout.addWidget(result_group, 1)
 
         log_group = QGroupBox("运行日志", panel)
         log_layout = QVBoxLayout(log_group)
         self.log_output = QPlainTextEdit(log_group)
         self.log_output.setReadOnly(True)
+        self.log_output.setMaximumHeight(150)
         log_layout.addWidget(self.log_output)
         layout.addWidget(log_group)
 
@@ -250,25 +554,41 @@ class MainWindow(QMainWindow):
     def _build_fishing_tab(self) -> QWidget:
         page = QWidget(self)
         layout = QVBoxLayout(page)
-        layout.setSpacing(12)
+        layout.setSpacing(8)
 
         actions = QHBoxLayout()
         self.fishing_refresh_button = QPushButton("刷新线索", page)
         self.fishing_messages_button = QPushButton("查看会话", page)
+        self.fishing_headless_checkbox = QCheckBox("无头模式", page)
+        self.fishing_headless_checkbox.setChecked(True)
         self.fishing_status_combo = QComboBox(page)
-        self.fishing_status_combo.addItems(["pending", "fishing", "manual_required", "failed", "resolved"])
+        self.fishing_status_combo.addItems([
+            "pending",
+            "fishing",
+            "seller_replied",
+            "manual_required",
+            "failed",
+            "evidence_collected",
+            "resolved",
+        ])
         self.fishing_update_status_button = QPushButton("更新状态", page)
         self.fishing_delete_button = QPushButton("删除商品", page)
+        self.fishing_batch_start_button = QPushButton("批量询价", page)
+        self.fishing_batch_stop_button = QPushButton("停止批量", page)
         actions.addWidget(self.fishing_refresh_button)
         actions.addWidget(self.fishing_messages_button)
+        actions.addWidget(self.fishing_headless_checkbox)
         actions.addWidget(self.fishing_status_combo)
         actions.addWidget(self.fishing_update_status_button)
         actions.addWidget(self.fishing_delete_button)
+        actions.addWidget(self.fishing_batch_start_button)
+        actions.addWidget(self.fishing_batch_stop_button)
         actions.addStretch(1)
         layout.addLayout(actions)
 
-        self.fishing_table = QTableWidget(0, 11, page)
+        self.fishing_table = QTableWidget(0, 12, page)
         self.fishing_table.setHorizontalHeaderLabels([
+            "选择",
             "序号",
             "商品",
             "标题",
@@ -282,22 +602,47 @@ class MainWindow(QMainWindow):
             "操作",
         ])
         self.fishing_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.fishing_table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.fishing_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.fishing_table.verticalHeader().setVisible(False)
         self.fishing_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.fishing_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.fishing_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
+        self.fishing_table.horizontalHeader().setSectionResizeMode(10, QHeaderView.Fixed)
+        self.fishing_table.horizontalHeader().setSectionResizeMode(11, QHeaderView.Fixed)
+        self.fishing_table.setColumnWidth(0, 46)
+        self.fishing_table.setColumnWidth(1, 52)
+        self.fishing_table.setColumnWidth(10, 68)
+        self.fishing_table.setColumnWidth(11, 86)
         layout.addWidget(self.fishing_table)
 
         self.fishing_log_output = QPlainTextEdit(page)
         self.fishing_log_output.setReadOnly(True)
+        self.fishing_log_output.setMaximumHeight(120)
         layout.addWidget(self.fishing_log_output)
 
         self.fishing_refresh_button.clicked.connect(self.fishing_refresh_requested.emit)
         self.fishing_messages_button.clicked.connect(self._emit_selected_fishing_messages)
         self.fishing_update_status_button.clicked.connect(self._emit_selected_fishing_status_update)
         self.fishing_delete_button.clicked.connect(self._emit_selected_fishing_delete)
+        self.fishing_batch_start_button.clicked.connect(self._emit_selected_fishing_batch_start)
+        self.fishing_batch_stop_button.clicked.connect(self.fishing_batch_stop_requested.emit)
         self.fishing_table.itemSelectionChanged.connect(self._sync_fishing_buttons)
+        self.fishing_table.itemChanged.connect(lambda _item: self._sync_fishing_buttons())
+        self.fishing_messages_button.setEnabled(False)
+        self.fishing_batch_start_button.setEnabled(False)
+        self.fishing_batch_stop_button.setEnabled(False)
         self._sync_fishing_buttons()
         return page
+
+    def fishing_headless_enabled(self) -> bool:
+        return self.fishing_headless_checkbox.isChecked()
+
+    def set_fishing_batch_running(self, running: bool) -> None:
+        self._fishing_batch_running = running
+        self.fishing_batch_start_button.setEnabled(False)
+        self.fishing_batch_stop_button.setEnabled(running)
+        self._sync_fishing_buttons()
 
     def _build_config_tab(self) -> QWidget:
         page = QWidget(self)
@@ -327,13 +672,67 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.config_tabs)
         return page
 
+    def _build_model_config_tab(self) -> QWidget:
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setSpacing(12)
+
+        model_group = QGroupBox("LLM 模型", page)
+        form = QFormLayout(model_group)
+
+        self.llm_preset_combo = QComboBox(model_group)
+        self.llm_preset_combo.addItems(list(LLM_PRESETS.keys()))
+        form.addRow("服务", self.llm_preset_combo)
+
+        self.llm_provider_input = QComboBox(model_group)
+        self.llm_provider_input.addItems(["openai_compatible", "anthropic"])
+        form.addRow("Provider", self.llm_provider_input)
+
+        self.llm_model_input = QComboBox(model_group)
+        self.llm_model_input.setEditable(True)
+        self.llm_model_input.addItems([
+            "qwen3.6-plus",
+            "deepseek-chat",
+            "gpt-4o-mini",
+            "gpt-4o",
+            "claude-3-5-sonnet-latest",
+        ])
+        form.addRow("模型", self.llm_model_input)
+
+        self.llm_api_base_input = QLineEdit(model_group)
+        form.addRow("API Base", self.llm_api_base_input)
+
+        self.llm_api_key_input = QLineEdit(model_group)
+        self.llm_api_key_input.setEchoMode(QLineEdit.Password)
+        form.addRow("API Key", self.llm_api_key_input)
+
+        self.llm_temperature_input = QDoubleSpinBox(model_group)
+        self.llm_temperature_input.setRange(0, 2)
+        self.llm_temperature_input.setSingleStep(0.1)
+        self.llm_temperature_input.setDecimals(2)
+        form.addRow("Temperature", self.llm_temperature_input)
+
+        actions = QHBoxLayout()
+        self.save_llm_config_button = QPushButton("保存模型配置", model_group)
+        self.reload_llm_config_button = QPushButton("重新加载", model_group)
+        actions.addWidget(self.save_llm_config_button)
+        actions.addWidget(self.reload_llm_config_button)
+        actions.addStretch(1)
+        form.addRow("", self._wrap_layout(actions, model_group))
+
+        layout.addWidget(model_group)
+        layout.addStretch(1)
+
+        self.llm_preset_combo.currentTextChanged.connect(self._apply_llm_preset)
+        self.save_llm_config_button.clicked.connect(self._emit_save_llm_config)
+        self.reload_llm_config_button.clicked.connect(self.refresh_requested.emit)
+        return page
+
     def set_platforms(self, platforms: list[str]) -> None:
         current = self.platform_combo.currentText()
         self.platform_combo.blockSignals(True)
         self.platform_combo.clear()
-        self.platform_combo.addItem("all")
-        for platform in platforms:
-            self.platform_combo.addItem(platform)
+        self.platform_combo.addItem("xianyu")
         index = self.platform_combo.findText(current)
         self.platform_combo.setCurrentIndex(index if index >= 0 else 0)
         self.platform_combo.blockSignals(False)
@@ -343,11 +742,19 @@ class MainWindow(QMainWindow):
         self.products_label.setText("，".join(products) if products else "无")
         self.accounts_label.setText("，".join(accounts) if accounts else "无")
 
+    def set_token_usage(self, usage: dict) -> None:
+        self.token_usage_label.setText(
+            f"requests={usage.get('requests', 0)}, "
+            f"prompt={usage.get('prompt_tokens', 0)}, "
+            f"completion={usage.get('completion_tokens', 0)}, "
+            f"total={usage.get('total_tokens', 0)}"
+        )
+
     def set_login_accounts(self, accounts: list[dict]) -> None:
-        self._accounts = accounts
+        self._accounts = [account for account in accounts if account["platform"] == "xianyu"]
         current_platform = self.login_platform_combo.currentText()
 
-        platforms = sorted({account["platform"] for account in accounts})
+        platforms = sorted({account["platform"] for account in self._accounts})
         self.login_platform_combo.blockSignals(True)
         self.login_platform_combo.clear()
         for platform in platforms:
@@ -359,6 +766,7 @@ class MainWindow(QMainWindow):
         self._refresh_login_account_combo()
 
     def set_account_statuses(self, accounts: list[dict]) -> None:
+        accounts = [account for account in accounts if account["platform"] == "xianyu"]
         self.account_table.setRowCount(len(accounts))
         for row_index, account in enumerate(accounts):
             values = [
@@ -377,7 +785,7 @@ class MainWindow(QMainWindow):
         self.start_button.setDisabled(running)
         self.stop_button.setEnabled(running)
         self.refresh_button.setDisabled(running)
-        self.status_label.setText("运行中" if running else "空闲")
+        self._set_status_label("运行中" if running else "空闲", "running" if running else "idle")
 
     def set_login_busy(self, busy: bool) -> None:
         self.open_login_button.setDisabled(busy or self._login_session_active)
@@ -397,7 +805,7 @@ class MainWindow(QMainWindow):
 
     def prepare_for_run(self) -> None:
         self.clear_log()
-        self.status_label.setText("准备中")
+        self._set_status_label("准备中", "warning")
         self.started_label.setText("-")
         self.finished_label.setText("-")
         self.totals_label.setText("-")
@@ -408,7 +816,7 @@ class MainWindow(QMainWindow):
         self._set_output_button(self.open_output_dir_button, "")
 
     def mark_run_stopped(self) -> None:
-        self.status_label.setText("已停止")
+        self._set_status_label("已停止", "warning")
         self.finished_label.setText(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     def append_log(self, message: str) -> None:
@@ -421,7 +829,7 @@ class MainWindow(QMainWindow):
         self.log_output.clear()
 
     def show_summary(self, summary) -> None:
-        self.status_label.setText("完成")
+        self._set_status_label("已完成", "success")
         self.started_label.setText(summary.started_at.strftime("%Y-%m-%d %H:%M:%S"))
         self.finished_label.setText(summary.finished_at.strftime("%Y-%m-%d %H:%M:%S"))
         self.totals_label.setText(
@@ -466,10 +874,41 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def set_config_documents(self, documents: dict) -> None:
+        settings_text = documents.get("settings.yaml")
+        if settings_text is not None and hasattr(self, "llm_provider_input"):
+            try:
+                settings = yaml.safe_load(settings_text) or {}
+                self.set_llm_config(settings.get("llm", {}))
+            except yaml.YAMLError as exc:
+                self.append_log(f"Failed to load model config: {exc}")
+
+        if not hasattr(self, "config_editors"):
+            return
         for filename, content in documents.items():
             editor = self.config_editors.get(filename)
             if editor is not None:
                 editor.setPlainText(content)
+
+    def set_llm_config(self, llm_config: dict) -> None:
+        provider = str(llm_config.get("provider") or "openai_compatible")
+        model = str(llm_config.get("model") or "")
+        api_base = str(llm_config.get("api_base") or "")
+        api_key = str(llm_config.get("api_key") or "")
+        temperature = float(llm_config.get("temperature", 0.7))
+
+        self.llm_provider_input.setCurrentText(provider)
+        if self.llm_model_input.findText(model) < 0:
+            self.llm_model_input.addItem(model)
+        self.llm_model_input.setCurrentText(model)
+        self.llm_api_base_input.setText(api_base)
+        self.llm_api_key_input.setText(api_key)
+        self.llm_temperature_input.setValue(temperature)
+
+        preset = self._llm_preset_for(provider, model, api_base)
+        if preset:
+            self.llm_preset_combo.blockSignals(True)
+            self.llm_preset_combo.setCurrentText(preset)
+            self.llm_preset_combo.blockSignals(False)
 
     def set_fishing_alerts(self, alerts: list[dict]) -> None:
         self._fishing_alerts = alerts
@@ -487,32 +926,44 @@ class MainWindow(QMainWindow):
                 alert.get("created_at", ""),
             ]
             alert_id = int(alert.get("alert_id") or 0)
+            check_item = QTableWidgetItem()
+            check_item.setData(Qt.UserRole, alert_id)
+            check_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
+            check_item.setCheckState(Qt.Unchecked)
+            self.fishing_table.setItem(row_index, 0, check_item)
             for column_index, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if column_index == 0:
                     item.setData(Qt.UserRole, alert_id)
-                self.fishing_table.setItem(row_index, column_index, item)
+                self.fishing_table.setItem(row_index, column_index + 1, item)
 
             open_button = QPushButton("打开", self.fishing_table)
+            open_button.setProperty("role", "small")
+            open_button.setFixedSize(54, 22)
+            self._refresh_widget_style(open_button)
             open_button.clicked.connect(
                 lambda _checked=False, row_alert_id=alert_id: self.fishing_open_listing_requested.emit(row_alert_id)
             )
-            self.fishing_table.setCellWidget(row_index, 9, open_button)
+            self.fishing_table.setCellWidget(row_index, 10, open_button)
 
             start_button = QPushButton("发起询价", self.fishing_table)
+            start_button.setProperty("role", "small")
+            start_button.setFixedSize(72, 22)
+            start_button.setEnabled(False)
+            self._refresh_widget_style(start_button)
             start_button.clicked.connect(
                 lambda _checked=False, row_alert_id=alert_id: self.fishing_start_requested.emit(row_alert_id)
             )
-            self.fishing_table.setCellWidget(row_index, 10, start_button)
+            self.fishing_table.setCellWidget(row_index, 11, start_button)
         self._sync_fishing_buttons()
 
     def _emit_start_requested(self) -> None:
         self.start_requested.emit(
             {
                 "platform": self.platform_combo.currentText(),
-                "dry_run": self.dry_run_checkbox.isChecked(),
+                "dry_run": False,
                 "headless": self.headless_checkbox.isChecked(),
-                "debug_fast": self.debug_fast_checkbox.isChecked(),
+                "debug_fast": False,
                 "db_path": self.db_path_input.text().strip() or "data/price_monitor.db",
             }
         )
@@ -527,6 +978,38 @@ class MainWindow(QMainWindow):
                 "content": editor.toPlainText(),
             }
         )
+
+    def _emit_save_llm_config(self) -> None:
+        self.save_llm_config_requested.emit(
+            {
+                "provider": self.llm_provider_input.currentText().strip(),
+                "model": self.llm_model_input.currentText().strip(),
+                "api_key": self.llm_api_key_input.text().strip(),
+                "api_base": self.llm_api_base_input.text().strip(),
+                "temperature": self.llm_temperature_input.value(),
+            }
+        )
+
+    def _apply_llm_preset(self, preset_name: str) -> None:
+        preset = LLM_PRESETS.get(preset_name)
+        if not preset:
+            return
+        self.llm_provider_input.setCurrentText(preset["provider"])
+        if preset["model"]:
+            self.llm_model_input.setCurrentText(preset["model"])
+        self.llm_api_base_input.setText(preset["api_base"])
+        if preset["api_key"]:
+            self.llm_api_key_input.setText(preset["api_key"])
+
+    def _llm_preset_for(self, provider: str, model: str, api_base: str) -> str:
+        for name, preset in LLM_PRESETS.items():
+            if (
+                preset["provider"] == provider
+                and preset["model"] == model
+                and preset["api_base"] == api_base
+            ):
+                return name
+        return "自定义 OpenAI-compatible"
 
     def _emit_open_login_requested(self) -> None:
         account_id = self.login_account_combo.currentData()
@@ -618,6 +1101,9 @@ class MainWindow(QMainWindow):
         row = self.fishing_table.currentRow()
         if row < 0:
             return 0
+        return self._fishing_alert_id_for_row(row)
+
+    def _fishing_alert_id_for_row(self, row: int) -> int:
         item = self.fishing_table.item(row, 0)
         if item is None:
             return 0
@@ -627,15 +1113,41 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             return 0
 
+    def _selected_fishing_alert_ids(self) -> list[int]:
+        checked_rows = []
+        for row in range(self.fishing_table.rowCount()):
+            item = self.fishing_table.item(row, 0)
+            if item is not None and item.checkState() == Qt.Checked:
+                checked_rows.append(row)
+
+        rows = []
+        if checked_rows:
+            rows = checked_rows
+        selection = self.fishing_table.selectionModel()
+        if not rows and selection is not None:
+            rows = sorted(index.row() for index in selection.selectedRows())
+        if not rows and self.fishing_table.currentRow() >= 0:
+            rows = [self.fishing_table.currentRow()]
+
+        alert_ids = []
+        seen = set()
+        for row in rows:
+            alert_id = self._fishing_alert_id_for_row(row)
+            if alert_id and alert_id not in seen:
+                seen.add(alert_id)
+                alert_ids.append(alert_id)
+        return alert_ids
+
     def _sync_fishing_buttons(self) -> None:
         has_alert = bool(self._selected_fishing_alert_id())
-        self.fishing_messages_button.setEnabled(has_alert)
+        self.fishing_messages_button.setEnabled(False)
         self.fishing_update_status_button.setEnabled(has_alert)
         self.fishing_delete_button.setEnabled(has_alert)
+        self.fishing_batch_start_button.setEnabled(False)
         self.fishing_status_combo.setEnabled(has_alert)
         if not has_alert:
             return
-        status_item = self.fishing_table.item(self.fishing_table.currentRow(), 7)
+        status_item = self.fishing_table.item(self.fishing_table.currentRow(), 8)
         status = status_item.text() if status_item else ""
         index = self.fishing_status_combo.findText(status)
         if index >= 0:
@@ -662,3 +1174,8 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.Yes:
             self.fishing_delete_requested.emit(alert_id)
+
+    def _emit_selected_fishing_batch_start(self) -> None:
+        alert_ids = self._selected_fishing_alert_ids()
+        if alert_ids:
+            self.fishing_batch_start_requested.emit(alert_ids)

@@ -95,11 +95,13 @@ class Database:
 
                 CREATE TABLE IF NOT EXISTS fishing_messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    listing_id INTEGER NOT NULL DEFAULT 0,
                     session_id INTEGER NOT NULL,
                     sender TEXT NOT NULL,
                     content TEXT NOT NULL,
                     raw_payload TEXT DEFAULT '',
                     created_at TEXT DEFAULT (datetime('now', 'localtime')),
+                    FOREIGN KEY (listing_id) REFERENCES listings(id),
                     FOREIGN KEY (session_id) REFERENCES fishing_sessions(id)
                 );
 
@@ -115,6 +117,18 @@ class Database:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_price_alerts_listing_unique
                     ON price_alerts(listing_id);
             """)
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(fishing_messages)").fetchall()
+            }
+            if "listing_id" not in columns:
+                conn.execute("DELETE FROM fishing_messages")
+                conn.execute(
+                    "ALTER TABLE fishing_messages ADD COLUMN listing_id INTEGER NOT NULL DEFAULT 0"
+                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fishing_messages_listing ON fishing_messages(listing_id)"
+            )
 
     def save_run(self, run: SearchRun) -> int:
         with self._get_conn() as conn:
@@ -246,7 +260,15 @@ class Database:
                 FROM price_alerts a
                 JOIN listings l ON l.id = a.listing_id
                 WHERE a.platform = 'xianyu'
-                  AND a.status IN ('pending', 'fishing', 'manual_required', 'failed')
+                  AND a.status IN (
+                      'pending',
+                      'fishing',
+                      'waiting_seller',
+                      'seller_replied',
+                      'manual_required',
+                      'failed',
+                      'evidence_collected'
+                  )
                   AND a.judgment IN ('VIOLATION', 'SUSPECTED', 'DELIST', 'REVIEW')
                 ORDER BY
                     CASE a.product_name
@@ -303,16 +325,14 @@ class Database:
         if not url:
             return False
         with self._get_conn() as conn:
-            cur = conn.execute(
-                """
-                DELETE FROM price_alerts
-                WHERE listing_id IN (
-                    SELECT id FROM listings WHERE url = ?
-                )
-                """,
+            rows = conn.execute(
+                "SELECT id FROM listings WHERE url = ?",
                 (url,),
-            )
-            return cur.rowcount > 0
+            ).fetchall()
+            deleted = False
+            for row in rows:
+                deleted = self._delete_listing_graph(conn, int(row["id"])) or deleted
+            return deleted
 
     def clear_business_data(self) -> None:
         with self._get_conn() as conn:
@@ -364,14 +384,21 @@ class Database:
             )
             return cur.lastrowid
 
-    def save_fishing_message(self, session_id: int, sender: str, content: str, raw_payload: str = "") -> int:
+    def save_fishing_message(
+        self,
+        listing_id: int,
+        session_id: int,
+        sender: str,
+        content: str,
+        raw_payload: str = "",
+    ) -> int:
         with self._get_conn() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO fishing_messages (session_id, sender, content, raw_payload)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO fishing_messages (listing_id, session_id, sender, content, raw_payload)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (session_id, sender, content, raw_payload),
+                (listing_id, session_id, sender, content, raw_payload),
             )
             return cur.lastrowid
 
@@ -379,7 +406,7 @@ class Database:
         with self._get_conn() as conn:
             rows = conn.execute(
                 """
-                SELECT id, session_id, sender, content, raw_payload, created_at
+                SELECT id, listing_id, session_id, sender, content, raw_payload, created_at
                 FROM fishing_messages
                 WHERE session_id = ?
                 ORDER BY id ASC
@@ -388,22 +415,56 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def list_fishing_messages_by_listing(self, listing_id: int) -> List[dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, listing_id, session_id, sender, content, raw_payload, created_at
+                FROM fishing_messages
+                WHERE listing_id = ?
+                ORDER BY id ASC
+                """,
+                (listing_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def replace_fishing_messages_for_listing(
+        self,
+        listing_id: int,
+        session_id: int,
+        messages: List[dict],
+    ) -> None:
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM fishing_messages WHERE listing_id = ?", (listing_id,))
+            for message in messages:
+                sender = str(message.get("sender", "")).strip()
+                content = str(message.get("content", "")).strip()
+                if not sender or not content:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO fishing_messages (listing_id, session_id, sender, content, raw_payload)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (listing_id, session_id, sender, content, str(message.get("raw_payload", ""))),
+                )
+
     def delete_alert(self, alert_id: int) -> bool:
         with self._get_conn() as conn:
-            session_rows = conn.execute(
-                "SELECT id FROM fishing_sessions WHERE alert_id = ?",
+            row = conn.execute(
+                "SELECT listing_id FROM price_alerts WHERE id = ?",
                 (alert_id,),
-            ).fetchall()
-            session_ids = [int(row["id"]) for row in session_rows]
-            if session_ids:
-                placeholders = ",".join("?" for _ in session_ids)
-                conn.execute(
-                    f"DELETE FROM fishing_messages WHERE session_id IN ({placeholders})",
-                    session_ids,
-                )
-            conn.execute("DELETE FROM fishing_sessions WHERE alert_id = ?", (alert_id,))
-            cur = conn.execute("DELETE FROM price_alerts WHERE id = ?", (alert_id,))
-            return cur.rowcount > 0
+            ).fetchone()
+            if not row:
+                return False
+            return self._delete_listing_graph(conn, int(row["listing_id"]))
+
+    def _delete_listing_graph(self, conn, listing_id: int) -> bool:
+        conn.execute("DELETE FROM fishing_messages WHERE listing_id = ?", (listing_id,))
+        conn.execute("DELETE FROM fishing_sessions WHERE listing_id = ?", (listing_id,))
+        alert_cur = conn.execute("DELETE FROM price_alerts WHERE listing_id = ?", (listing_id,))
+        listing_cur = conn.execute("DELETE FROM listings WHERE id = ?", (listing_id,))
+        return alert_cur.rowcount > 0 or listing_cur.rowcount > 0
 
     def update_alert_status(self, alert_id: int, status: str) -> bool:
         with self._get_conn() as conn:

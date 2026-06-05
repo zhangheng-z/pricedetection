@@ -203,10 +203,10 @@ class XianyuAgent(BaseAgent):
 
         return ""
 
-    async def start_chat_for_listing(self, url: str) -> Page:
-        self.browser = BrowserManager(
+    def _build_fishing_browser(self, headless: bool) -> BrowserManager:
+        return BrowserManager(
             proxy=self.proxy,
-            headless=self.headless,
+            headless=headless,
             storage_state=self.account.storage_state or None,
             user_data_dir=self.account.user_data_dir or None,
             browser_channel=self.account.browser_channel or "msedge",
@@ -220,11 +220,14 @@ class XianyuAgent(BaseAgent):
             randomize_user_agent=bool(getattr(self.anti_risk, "randomize_user_agent", False)),
             randomize_viewport=bool(getattr(self.anti_risk, "randomize_viewport", False)),
         )
-        print(f"[{self.PLATFORM}] fishing browser starting", flush=True)
-        await self.browser.start()
-        print(f"[{self.PLATFORM}] fishing browser started", flush=True)
-        if not self.account.storage_state and self.account.cookies_encrypted:
+
+    async def _load_fishing_account_cookies(self) -> None:
+        if self.browser and not self.account.storage_state and self.account.cookies_encrypted:
             await self.browser.load_cookie_header(self.account.cookies_encrypted, self._cookie_url())
+
+    async def _open_fishing_detail_page(self, url: str) -> Page:
+        if not self.browser:
+            raise RuntimeError("Fishing browser is not started.")
 
         print(f"[{self.PLATFORM}] fishing opening new page", flush=True)
         page = await asyncio.wait_for(self.browser.new_page(), timeout=15)
@@ -234,7 +237,18 @@ class XianyuAgent(BaseAgent):
         except PlaywrightTimeoutError:
             print(f"[{self.PLATFORM}] fishing goto timed out, continue with current page: {page.url}", flush=True)
         print(f"[{self.PLATFORM}] fishing detail page loaded: {page.url}", flush=True)
+        return page
+
+    async def start_chat_for_listing(self, url: str) -> Page:
+        self.browser = self._build_fishing_browser(self.headless)
+        print(f"[{self.PLATFORM}] fishing browser starting", flush=True)
+        await self.browser.start()
+        print(f"[{self.PLATFORM}] fishing browser started", flush=True)
+        await self._load_fishing_account_cookies()
+
+        page = await self._open_fishing_detail_page(url)
         await self._wait_for_verification_appearance(page, "after fishing detail open", timeout_seconds=3)
+        page = await self._ensure_fishing_login(page, url)
         print(f"[{self.PLATFORM}] fishing clicking chat button", flush=True)
         if not await self._click_chat_button(page):
             await self._save_fishing_debug_snapshot(page, "chat_button_not_found")
@@ -245,11 +259,154 @@ class XianyuAgent(BaseAgent):
         await self._wait_for_verification_appearance(page, "after fishing chat open", timeout_seconds=3)
         page = await self._resolve_chat_page(page)
         if not await self._has_chat_input(page):
+            if await self._is_login_required_page(page):
+                page = await self._ensure_fishing_login(page, url)
+                await self._wait_for_fishing_page_stable(page, timeout=5000)
+                if not await self._has_chat_input(page):
+                    if not await self._click_chat_button(page):
+                        await self._save_fishing_debug_snapshot(page, "chat_button_not_found_after_login")
+                        raise RuntimeError("Login finished, but chat button was not found.")
+                    await self._wait_for_fishing_page_stable(page, timeout=5000)
+                    await AntiDetect.random_delay(1, 2)
+                    page = await self._resolve_chat_page(page)
+            if await self._has_chat_input(page):
+                print(f"[{self.PLATFORM}] fishing chat page ready: {page.url}", flush=True)
+                return page
             await self._save_fishing_debug_snapshot(page, "chat_page_not_ready")
             await self._save_fishing_input_diagnostics(page, reason="chat_page_not_ready")
             raise RuntimeError("已点击聊天入口，但未检测到聊天输入框")
         print(f"[{self.PLATFORM}] fishing chat page ready: {page.url}", flush=True)
         return page
+
+    async def _ensure_fishing_login(self, page: Page, url: str) -> Page:
+        if not await self._is_login_required_page(page):
+            return page
+
+        if self.headless:
+            print(
+                f"[{self.PLATFORM}] login required in headless fishing mode. "
+                "Switching to a visible browser for manual login.",
+                flush=True,
+            )
+            page = await self._restart_fishing_browser_visible(url)
+        else:
+            print(
+                f"[{self.PLATFORM}] login required. Please finish login in the visible browser.",
+                flush=True,
+            )
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
+
+        await self._wait_for_manual_fishing_login(page)
+        await self._save_fishing_login_state(page)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        except PlaywrightTimeoutError:
+            print(f"[{self.PLATFORM}] fishing reload after login timed out: {page.url}", flush=True)
+        await self._wait_for_fishing_page_stable(page, timeout=5000)
+        await self._wait_for_verification_appearance(page, "after fishing login", timeout_seconds=3)
+        return page
+
+    async def _restart_fishing_browser_visible(self, url: str) -> Page:
+        if self.browser:
+            await self.browser.stop()
+        self.headless = False
+        self.browser = self._build_fishing_browser(False)
+        print(f"[{self.PLATFORM}] fishing visible login browser starting", flush=True)
+        await self.browser.start()
+        print(f"[{self.PLATFORM}] fishing visible login browser started", flush=True)
+        await self._load_fishing_account_cookies()
+        page = await self._open_fishing_detail_page(url)
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        return page
+
+    async def _wait_for_manual_fishing_login(self, page: Page) -> None:
+        wait_seconds = 0
+        while True:
+            if page.is_closed():
+                raise RuntimeError("Login browser was closed before login finished.")
+            if not await self._is_login_required_page(page):
+                break
+            await asyncio.sleep(5)
+            wait_seconds += 5
+            if wait_seconds % 30 == 0:
+                print(f"[{self.PLATFORM}] still waiting for manual login ({wait_seconds}s).", flush=True)
+
+        print(f"[{self.PLATFORM}] login state detected; resuming fishing.", flush=True)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        await AntiDetect.random_delay(1, 2)
+
+    async def _save_fishing_login_state(self, page: Page) -> None:
+        if not self.account.storage_state:
+            return
+        try:
+            storage_state = Path(self.account.storage_state)
+            storage_state.parent.mkdir(parents=True, exist_ok=True)
+            await page.context.storage_state(path=str(storage_state))
+            print(f"[{self.PLATFORM}] saved login state: {storage_state}", flush=True)
+        except Exception as exc:
+            print(f"[{self.PLATFORM}] failed to save login state: {exc}", flush=True)
+
+    async def _is_login_required_page(self, page: Page) -> bool:
+        try:
+            current_url = (page.url or "").lower()
+            if any(marker in current_url for marker in ("login.taobao.com", "passport", "/member/login")):
+                return True
+            return bool(
+                await page.evaluate(
+                    r"""
+                    () => {
+                        const visible = (el) => {
+                            const rect = el.getBoundingClientRect();
+                            const style = window.getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 &&
+                                style.visibility !== 'hidden' &&
+                                style.display !== 'none' &&
+                                Number(style.opacity || 1) > 0;
+                        };
+                        const text = (document.body?.innerText || '').replace(/\s+/g, '');
+                        const strongMarkers = [
+                            '\u5bc6\u7801\u767b\u5f55',
+                            '\u77ed\u4fe1\u767b\u5f55',
+                            '\u9a8c\u8bc1\u7801\u767b\u5f55',
+                            '\u6dd8\u5b9d\u8d26\u53f7\u767b\u5f55',
+                            '\u8bf7\u5148\u767b\u5f55',
+                            '\u4eb2\uff0c\u8bf7\u767b\u5f55',
+                            '\u767b\u5f55\u540e\u67e5\u770b'
+                        ];
+                        if (strongMarkers.some((marker) => text.includes(marker))) return true;
+
+                        const inputs = Array.from(document.querySelectorAll('input')).filter(visible);
+                        const hasAccountInput = inputs.some((el) => {
+                            const attrs = [
+                                el.getAttribute('placeholder') || '',
+                                el.getAttribute('aria-label') || '',
+                                el.getAttribute('name') || ''
+                            ].join('');
+                            return /(\u624b\u673a|\u8d26\u53f7|\u5bc6\u7801|phone|mobile|login|password)/i.test(attrs);
+                        });
+                        if (!hasAccountInput) return false;
+
+                        const buttons = Array.from(document.querySelectorAll('button, [role="button"], a, div, span'))
+                            .filter(visible);
+                        return buttons.some((el) => {
+                            const label = (el.innerText || el.textContent || '').replace(/\s+/g, '');
+                            return label === '\u767b\u5f55' || label.includes('\u767b\u5f55\u5e76\u540c\u610f');
+                        });
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return False
 
     async def fill_chat_message(self, page: Page, message: str) -> bool:
         await self._scroll_chat_messages_to_bottom(page)
@@ -569,6 +726,13 @@ class XianyuAgent(BaseAgent):
             print(f"[{self.PLATFORM}] fishing input failed", flush=True)
             return False
 
+        before_messages = await self.read_chat_messages(
+            page,
+            save_diagnostics=False,
+            scroll_to_top=False,
+            verbose=False,
+        )
+        before_count = self._count_message_occurrences(before_messages, message)
         print(f"[{self.PLATFORM}] fishing clicking send", flush=True)
         await AntiDetect.random_delay(0.4, 0.8)
         send_labels = ["发送", "发 送"]
@@ -585,7 +749,7 @@ class XianyuAgent(BaseAgent):
                         await locator.click(timeout=3000)
                         await self._wait_for_fishing_page_stable(page, timeout=5000)
                         print(f"[{self.PLATFORM}] fishing send clicked by text", flush=True)
-                        return True
+                        return await self._wait_for_sent_message(page, message, before_count)
                 except Exception:
                     continue
         clicked = await self._fishing_evaluate(
@@ -621,19 +785,49 @@ class XianyuAgent(BaseAgent):
         if clicked:
             await self._wait_for_fishing_page_stable(page, timeout=5000)
             print(f"[{self.PLATFORM}] fishing send clicked by dom", flush=True)
-            return True
+            return await self._wait_for_sent_message(page, message, before_count)
         if await self._click_send_by_coordinates(page):
             print(f"[{self.PLATFORM}] fishing send clicked by coordinates", flush=True)
-            return True
+            return await self._wait_for_sent_message(page, message, before_count)
         try:
             await page.keyboard.press("Enter")
             await self._wait_for_fishing_page_stable(page, timeout=5000)
             await AntiDetect.random_delay(0.5, 1.0)
             print(f"[{self.PLATFORM}] fishing send triggered by enter", flush=True)
-            return True
+            return await self._wait_for_sent_message(page, message, before_count)
         except Exception:
             await self._save_fishing_debug_snapshot(page, "chat_send_failed")
             return False
+
+    async def _wait_for_sent_message(self, page: Page, message: str, before_count: int, timeout_seconds: int = 8) -> bool:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while True:
+            messages = await self.read_chat_messages(
+                page,
+                save_diagnostics=False,
+                scroll_to_top=False,
+                verbose=False,
+            )
+            current_count = self._count_message_occurrences(messages, message)
+            input_empty = not await self._chat_input_has_text(page, message)
+            if current_count > before_count or (current_count > 0 and input_empty):
+                print(f"[{self.PLATFORM}] fishing send confirmed", flush=True)
+                return True
+            if asyncio.get_running_loop().time() >= deadline:
+                print(f"[{self.PLATFORM}] fishing send not confirmed", flush=True)
+                await self._save_fishing_debug_snapshot(page, "chat_send_not_confirmed")
+                return False
+            await asyncio.sleep(1)
+
+    def _count_message_occurrences(self, messages: list[Dict[str, str]], message: str) -> int:
+        target = str(message or "").strip()
+        if not target:
+            return 0
+        return sum(
+            1
+            for item in messages
+            if item.get("sender") == "buyer" and target in str(item.get("content", ""))
+        )
 
     async def _click_send_by_coordinates(self, page: Page) -> bool:
         try:
@@ -757,10 +951,12 @@ class XianyuAgent(BaseAgent):
         page: Page,
         save_diagnostics: bool = False,
         scroll_to_top: bool = True,
+        verbose: bool = True,
     ) -> list[Dict[str, str]]:
         await self._wait_for_fishing_page_stable(page)
-        if scroll_to_top:
+        if scroll_to_top and verbose:
             print(f"[{self.PLATFORM}] fishing scrolling chat to top before reading", flush=True)
+        if scroll_to_top:
             await self._scroll_chat_messages_to_top(page)
         script = r"""
             () => {
@@ -846,10 +1042,12 @@ class XianyuAgent(BaseAgent):
         page: Page,
         save_diagnostics: bool = False,
         scroll_to_top: bool = True,
+        verbose: bool = True,
     ) -> list[Dict[str, str]]:
         await self._wait_for_fishing_page_stable(page)
-        if scroll_to_top:
+        if scroll_to_top and verbose:
             print(f"[{self.PLATFORM}] fishing scrolling chat to top before reading", flush=True)
+        if scroll_to_top:
             await self._scroll_chat_messages_to_top(page)
         script = r"""
             () => {
@@ -1026,13 +1224,14 @@ class XianyuAgent(BaseAgent):
             seen.add(key)
             result.append({"sender": message.get("sender", ""), "content": content})
         result = result[-80:]
-        print(f"[{self.PLATFORM}] fishing recognized chat messages: {len(result)}", flush=True)
-        for index, message in enumerate(result, 1):
-            print(
-                f"[{self.PLATFORM}] fishing chat message {index}: "
-                f"{message.get('sender', '')}: {message.get('content', '')}",
-                flush=True,
-            )
+        if verbose:
+            print(f"[{self.PLATFORM}] fishing recognized chat messages: {len(result)}", flush=True)
+            for index, message in enumerate(result, 1):
+                print(
+                    f"[{self.PLATFORM}] fishing chat message {index}: "
+                    f"{message.get('sender', '')}: {message.get('content', '')}",
+                    flush=True,
+                )
         return result
 
     async def wait_for_seller_messages(
@@ -1043,7 +1242,12 @@ class XianyuAgent(BaseAgent):
     ) -> list[Dict[str, str]]:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while True:
-            messages = await self.read_chat_messages(page, save_diagnostics=True, scroll_to_top=False)
+            messages = await self.read_chat_messages(
+                page,
+                save_diagnostics=False,
+                scroll_to_top=False,
+                verbose=False,
+            )
             new_seller_messages = [
                 message for message in messages
                 if message.get("sender") == "seller" and message.get("content") not in known_contents

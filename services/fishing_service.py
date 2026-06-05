@@ -18,10 +18,27 @@ class FishingStartResult:
     status: str
 
 
+@dataclass
+class ReplyCheckSummary:
+    checked: int = 0
+    updated: int = 0
+    waiting: int = 0
+    failed: int = 0
+
+
 class FishingService:
     MAX_AUTO_REPLY_ROUNDS = 2
-    SELLER_REPLY_TIMEOUT_SECONDS = 45
-    ALERT_STATUSES = {"pending", "fishing", "manual_required", "failed", "resolved"}
+    SELLER_REPLY_TIMEOUT_SECONDS = 60
+    ALERT_STATUSES = {
+        "pending",
+        "fishing",
+        "waiting_seller",
+        "seller_replied",
+        "manual_required",
+        "failed",
+        "evidence_collected",
+        "resolved",
+    }
 
     def __init__(
         self,
@@ -35,8 +52,8 @@ class FishingService:
     def list_alerts(self, db_path: str) -> list[dict]:
         return Database(db_path).list_fishable_alerts()
 
-    def list_messages(self, db_path: str, session_id: int) -> list[dict]:
-        return Database(db_path).list_fishing_messages(session_id)
+    def list_messages(self, db_path: str, listing_id: int) -> list[dict]:
+        return Database(db_path).list_fishing_messages_by_listing(listing_id)
 
     def update_alert_status(self, db_path: str, alert_id: int, status: str) -> None:
         if status not in self.ALERT_STATUSES:
@@ -47,6 +64,40 @@ class FishingService:
     def delete_alert(self, db_path: str, alert_id: int) -> None:
         if not Database(db_path).delete_alert(alert_id):
             raise ValueError(f"Alert not found: {alert_id}")
+
+    async def check_waiting_replies(
+        self,
+        db_path: str,
+        limit: int = 10,
+        headless: bool = False,
+    ) -> ReplyCheckSummary:
+        alerts = [
+            alert
+            for alert in self.list_alerts(db_path)
+            if alert.get("status") == "waiting_seller"
+        ][:limit]
+        summary = ReplyCheckSummary()
+        for alert in alerts:
+            alert_id = int(alert.get("alert_id") or 0)
+            if not alert_id:
+                continue
+            try:
+                result = await self.start_fishing(
+                    db_path=db_path,
+                    alert_id=alert_id,
+                    auto_send=True,
+                    headless=headless,
+                )
+                summary.checked += 1
+                if result.status == "waiting_seller":
+                    summary.waiting += 1
+                else:
+                    summary.updated += 1
+            except Exception as exc:
+                summary.checked += 1
+                summary.failed += 1
+                self._log(f"[fishing] reply check failed alert={alert_id}: {exc}")
+        return summary
 
     async def start_fishing(
         self,
@@ -86,16 +137,49 @@ class FishingService:
 
             self._log(f"[fishing] reading existing conversation session={session_id}")
             existing_messages = await agent.read_chat_messages(page, save_diagnostics=True)
-            conversation_messages = []
-            seen_existing = set()
-            for existing_message in existing_messages:
-                content = str(existing_message.get("content", "")).strip()
-                sender = str(existing_message.get("sender", "")).strip() or "seller"
-                if not content or content in seen_existing:
-                    continue
-                seen_existing.add(content)
-                conversation_messages.append({"sender": sender, "content": content})
-                db.save_fishing_message(session_id, sender, content)
+            conversation_messages = self._normalize_dialogue_messages(existing_messages)
+            if self._sync_recognized_history(
+                db=db,
+                listing_id=alert["listing_id"],
+                session_id=session_id,
+                recognized_messages=conversation_messages,
+            ):
+                self._log(
+                    f"[fishing] warning: database messages did not match recognized history; "
+                    f"rebuilt listing messages listing={alert['listing_id']} session={session_id}"
+                )
+
+            if alert.get("status") == "waiting_seller" and self._last_dialogue_sender(conversation_messages) == "buyer":
+                self._log(f"[fishing] listing is waiting for seller; checking reply for 60 seconds session={session_id}")
+                known_contents = {
+                    str(message.get("content", "")).strip()
+                    for message in conversation_messages
+                    if str(message.get("content", "")).strip()
+                }
+                seller_messages = await agent.wait_for_seller_messages(
+                    page,
+                    known_contents,
+                    timeout_seconds=self.SELLER_REPLY_TIMEOUT_SECONDS,
+                )
+                seller_messages = self._normalize_dialogue_messages(seller_messages)
+                if not seller_messages:
+                    db.update_alert_status(alert_id, "waiting_seller")
+                    db.update_fishing_session_status(session_id, "waiting_seller", "waiting_seller_reply")
+                    await agent.close_fishing_browser()
+                    return FishingStartResult(
+                        session_id=session_id,
+                        alert_id=alert_id,
+                        message="",
+                        auto_sent=auto_send,
+                        status="waiting_seller",
+                    )
+                db.update_alert_status(alert_id, "seller_replied")
+                db.update_fishing_session_status(session_id, "seller_replied", "seller_replied_after_wait")
+                for seller_message in seller_messages:
+                    content = seller_message["content"]
+                    conversation_messages.append(seller_message)
+                    db.save_fishing_message(alert["listing_id"], session_id, "seller", content)
+                    self._log(f"[fishing] seller replied session={session_id}: {content}")
 
             if conversation_messages:
                 self._log(
@@ -107,7 +191,6 @@ class FishingService:
                 self._log(f"[fishing] no existing conversation detected session={session_id}")
                 message, llm_payload = self._build_initial_message(alert, llm)
 
-            db.save_fishing_message(session_id, "llm", message, json.dumps(llm_payload, ensure_ascii=False))
             should_stop = bool(llm_payload.get("should_stop")) if isinstance(llm_payload, dict) else False
             if should_stop:
                 self._log(
@@ -121,7 +204,7 @@ class FishingService:
                 raise RuntimeError("未找到可输入的聊天框")
 
             final_status = "message_sent" if auto_send else "message_filled"
-            db.save_fishing_message(session_id, "buyer", message)
+            db.save_fishing_message(alert["listing_id"], session_id, "buyer", message)
             conversation_messages.append({"sender": "buyer", "content": message})
             db.update_fishing_session_status(
                 session_id,
@@ -130,6 +213,7 @@ class FishingService:
             )
             if should_stop:
                 final_status = "evidence_collected"
+                db.update_alert_status(alert_id, "evidence_collected")
                 db.update_fishing_session_status(session_id, "evidence_collected", "final_message_sent")
             elif auto_send:
                 final_status = await self._run_auto_dialogue(
@@ -142,7 +226,10 @@ class FishingService:
                     sent_messages=[message],
                     conversation_messages=conversation_messages,
                 )
-            self._active_agents[session_id] = agent
+            if final_status == "waiting_seller":
+                await agent.close_fishing_browser()
+            else:
+                self._active_agents[session_id] = agent
             self._log(
                 f"[fishing] {'sent' if auto_send else 'filled'} next message "
                 f"session={session_id}: {message}"
@@ -219,9 +306,11 @@ class FishingService:
             )
             if not seller_messages:
                 self._log(f"[fishing] no seller reply detected session={session_id}")
+                db.update_alert_status(alert["alert_id"], "waiting_seller")
                 db.update_fishing_session_status(session_id, "waiting_seller", "waiting_seller_reply")
                 return "waiting_seller"
 
+            db.update_alert_status(alert["alert_id"], "seller_replied")
             db.update_fishing_session_status(session_id, "seller_replied", f"seller_replied_round_{round_index}")
             new_seller_messages = []
             for seller_message in seller_messages:
@@ -231,30 +320,30 @@ class FishingService:
                 known_contents.add(content)
                 new_seller_messages.append({"sender": "seller", "content": content})
                 conversation_messages.append({"sender": "seller", "content": content})
-                db.save_fishing_message(session_id, "seller", content)
+                db.save_fishing_message(alert["listing_id"], session_id, "seller", content)
                 self._log(f"[fishing] seller replied session={session_id}: {content}")
 
             if not new_seller_messages:
+                db.update_alert_status(alert["alert_id"], "waiting_seller")
                 db.update_fishing_session_status(session_id, "waiting_seller", "waiting_seller_reply")
                 return "waiting_seller"
 
             reply, reply_payload = self._build_reply_message(alert, llm, conversation_messages)
             should_stop = bool(reply_payload.get("should_stop")) if isinstance(reply_payload, dict) else False
             if should_stop:
-                db.save_fishing_message(session_id, "llm", reply, json.dumps(reply_payload, ensure_ascii=False))
                 self._log(f"[fishing] LLM decided to stop session={session_id}: {reply_payload.get('reason', '')}")
-            else:
-                db.save_fishing_message(session_id, "llm", reply, json.dumps(reply_payload, ensure_ascii=False))
             self._log(f"[fishing] sending reply round {round_index} session={session_id}: {reply}")
             if not await agent.send_chat_message(page, reply):
+                db.update_alert_status(alert["alert_id"], "manual_required")
                 db.update_fishing_session_status(session_id, "manual_required", "reply_send_failed")
                 return "manual_required"
 
             known_contents.add(reply)
             sent_messages.append(reply)
             conversation_messages.append({"sender": "buyer", "content": reply})
-            db.save_fishing_message(session_id, "buyer", reply)
+            db.save_fishing_message(alert["listing_id"], session_id, "buyer", reply)
             if should_stop:
+                db.update_alert_status(alert["alert_id"], "evidence_collected")
                 db.update_fishing_session_status(session_id, "evidence_collected", f"final_reply_sent_round_{round_index}")
                 return "evidence_collected"
             db.update_fishing_session_status(session_id, "dialogue_replied", f"reply_sent_round_{round_index}")
@@ -262,6 +351,45 @@ class FishingService:
 
         db.update_fishing_session_status(session_id, final_status, "max_auto_rounds_reached")
         return final_status
+
+    def _normalize_dialogue_messages(self, messages: list[dict]) -> list[dict]:
+        result = []
+        seen = set()
+        for message in messages:
+            sender = str(message.get("sender", "")).strip() or "seller"
+            content = str(message.get("content", "")).strip()
+            if sender not in {"buyer", "seller"} or not content:
+                continue
+            key = (sender, content)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append({"sender": sender, "content": content})
+        return result
+
+    def _last_dialogue_sender(self, messages: list[dict]) -> str:
+        for message in reversed(messages):
+            sender = str(message.get("sender", "")).strip()
+            if sender in {"buyer", "seller"}:
+                return sender
+        return ""
+
+    def _sync_recognized_history(
+        self,
+        db: Database,
+        listing_id: int,
+        session_id: int,
+        recognized_messages: list[dict],
+    ) -> bool:
+        stored_messages = [
+            {"sender": message.get("sender", ""), "content": message.get("content", "")}
+            for message in db.list_fishing_messages_by_listing(listing_id)
+            if message.get("sender") in {"buyer", "seller"}
+        ]
+        if stored_messages == recognized_messages:
+            return False
+        db.replace_fishing_messages_for_listing(listing_id, session_id, recognized_messages)
+        return True
 
     def _build_reply_message(
         self,

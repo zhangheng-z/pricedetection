@@ -262,6 +262,7 @@ class SearchEngine:
                         }
                     ],
                 )
+                self.llm.record_usage(response)
                 text = response.content[0].text.strip()
             else:
                 client = self.llm._get_openai_client()
@@ -281,6 +282,7 @@ class SearchEngine:
                     ],
                     temperature=0,
                 )
+                self.llm.record_usage(response)
                 text = response.choices[0].message.content.strip()
 
             if text and text != "null":
