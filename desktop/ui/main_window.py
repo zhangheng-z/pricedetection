@@ -73,6 +73,11 @@ FISHING_ALERT_STATUSES = [
     "resolved",
 ]
 
+FISHING_JUDGMENT_LABELS = {
+    "VIOLATION": "乱价",
+    "DELIST": "需下架",
+    "REVIEW": "需人工复核",
+}
 
 class MainWindow(QMainWindow):
     start_requested = Signal(dict)
@@ -579,7 +584,8 @@ class MainWindow(QMainWindow):
         output_actions.addWidget(self.open_report_button)
         output_actions.addWidget(self.open_output_dir_button)
         summary_layout.addRow("", self._wrap_layout(output_actions, summary_group))
-        summary_group.setMaximumHeight(190)
+        summary_group.setMinimumHeight(235)
+        summary_group.setMaximumHeight(260)
         layout.addWidget(summary_group)
 
         result_group = QGroupBox("本次结果", panel)
@@ -595,6 +601,15 @@ class MainWindow(QMainWindow):
 
         log_group = QGroupBox("运行日志", panel)
         log_layout = QVBoxLayout(log_group)
+        log_actions = QHBoxLayout()
+        log_actions.addStretch(1)
+        self.clear_log_button = QPushButton("清空日志", log_group)
+        self.clear_log_button.setProperty("role", "small")
+        self._refresh_widget_style(self.clear_log_button)
+        self.clear_log_button.setStyleSheet("min-height: 22px; max-height: 22px; padding: 0 8px;")
+        self.clear_log_button.setFixedSize(72, 22)
+        log_actions.addWidget(self.clear_log_button)
+        log_layout.addLayout(log_actions)
         self.log_output = QPlainTextEdit(log_group)
         self.log_output.setReadOnly(True)
         self.log_output.setMaximumHeight(150)
@@ -610,6 +625,7 @@ class MainWindow(QMainWindow):
         self.open_output_dir_button.clicked.connect(
             lambda: self.open_file_requested.emit(self.open_output_dir_button.property("path") or "")
         )
+        self.clear_log_button.clicked.connect(self.clear_log)
         self.results_table.cellDoubleClicked.connect(lambda row, _column: self.result_details_requested.emit(row))
         return panel
 
@@ -939,6 +955,8 @@ class MainWindow(QMainWindow):
 
     def clear_log(self) -> None:
         self.log_output.clear()
+        if hasattr(self, "fishing_log_output"):
+            self.fishing_log_output.clear()
 
     def show_summary(self, summary) -> None:
         self._set_status_label("已完成", "success")
@@ -1033,11 +1051,7 @@ class MainWindow(QMainWindow):
             "全部商品",
             sorted({str(alert.get("product_name", "")) for alert in alerts if alert.get("product_name")}),
         )
-        self._set_filter_combo_items(
-            self.fishing_judgment_filter,
-            "全部判断",
-            sorted({str(alert.get("judgment", "")) for alert in alerts if alert.get("judgment")}),
-        )
+        self._set_judgment_filter_items(alerts)
         self._set_filter_combo_items(
             self.fishing_table_status_filter,
             "全部状态",
@@ -1054,10 +1068,27 @@ class MainWindow(QMainWindow):
         combo.setCurrentIndex(index if index >= 0 else 0)
         combo.blockSignals(False)
 
+    def _set_judgment_filter_items(self, alerts: list[dict]) -> None:
+        current = self.fishing_judgment_filter.currentData()
+        values = list(FISHING_JUDGMENT_LABELS)
+        for alert in alerts:
+            judgment = str(alert.get("judgment", "")).upper()
+            if judgment and judgment not in values:
+                values.append(judgment)
+
+        self.fishing_judgment_filter.blockSignals(True)
+        self.fishing_judgment_filter.clear()
+        self.fishing_judgment_filter.addItem("全部判断", "")
+        for judgment in values:
+            self.fishing_judgment_filter.addItem(self._display_fishing_judgment(judgment), judgment)
+        index = self.fishing_judgment_filter.findData(current)
+        self.fishing_judgment_filter.setCurrentIndex(index if index >= 0 else 0)
+        self.fishing_judgment_filter.blockSignals(False)
+
     def _apply_fishing_filters(self) -> None:
         alerts = list(self._fishing_alerts)
         product = self.fishing_product_filter.currentText()
-        judgment = self.fishing_judgment_filter.currentText()
+        judgment = self.fishing_judgment_filter.currentData()
         status = self.fishing_table_status_filter.currentText()
         created_index = self.fishing_created_filter.currentIndex()
         price_sort_index = self.fishing_price_sort_combo.currentIndex()
@@ -1065,7 +1096,10 @@ class MainWindow(QMainWindow):
         if self.fishing_product_filter.currentIndex() > 0:
             alerts = [alert for alert in alerts if str(alert.get("product_name", "")) == product]
         if self.fishing_judgment_filter.currentIndex() > 0:
-            alerts = [alert for alert in alerts if str(alert.get("judgment", "")) == judgment]
+            alerts = [
+                alert for alert in alerts
+                if str(alert.get("judgment", "")).upper() == str(judgment).upper()
+            ]
         if self.fishing_table_status_filter.currentIndex() > 0:
             alerts = [alert for alert in alerts if str(alert.get("status", "")) == status]
         if created_index > 0:
@@ -1214,12 +1248,17 @@ class MainWindow(QMainWindow):
         layout.addWidget(start_button)
         return widget
 
+    def _display_fishing_judgment(self, judgment: str) -> str:
+        normalized = str(judgment or "").upper()
+        return FISHING_JUDGMENT_LABELS.get(normalized, judgment)
+
     def _render_fishing_alerts(self, alerts: list[dict], start_index: int = 0) -> None:
         self.fishing_table.setUpdatesEnabled(False)
         self.fishing_table.blockSignals(True)
         try:
             self.fishing_table.setRowCount(len(alerts))
             for row_index, alert in enumerate(alerts):
+                judgment = str(alert.get("judgment", ""))
                 values = [
                     str(start_index + row_index + 1),
                     alert.get("product_name", ""),
@@ -1227,7 +1266,7 @@ class MainWindow(QMainWindow):
                     alert.get("seller_name", ""),
                     str(alert.get("price", "")),
                     str(alert.get("official_price", "")),
-                    alert.get("judgment", ""),
+                    self._display_fishing_judgment(judgment),
                     alert.get("status", ""),
                     alert.get("created_at", ""),
                 ]
@@ -1241,6 +1280,8 @@ class MainWindow(QMainWindow):
                     item = QTableWidgetItem(value)
                     if column_index == 0:
                         item.setData(Qt.UserRole, alert_id)
+                    if column_index == 6:
+                        item.setData(Qt.UserRole, judgment.upper())
                     self.fishing_table.setItem(row_index, column_index + 1, item)
                 status_widget = self._build_fishing_status_widget(str(alert.get("status", "")))
                 self.fishing_table.setCellWidget(row_index, 8, status_widget)
