@@ -31,6 +31,7 @@ class DesktopController:
         self._reply_check_active = False
         self._batch_fishing_task = None
         self._batch_stop_requested = False
+        self._review_alerts_task = None
 
     def bind(self) -> None:
         self.log_bridge.message.connect(self.window.append_log)
@@ -53,6 +54,7 @@ class DesktopController:
         self.window.fishing_delete_requested.connect(self.delete_fishing_alert)
         self.window.fishing_batch_start_requested.connect(self.start_batch_fishing)
         self.window.fishing_batch_stop_requested.connect(self.stop_batch_fishing)
+        self.window.fishing_review_requested.connect(self.start_review_alerts)
         self.load_runtime_config()
         self.load_config_documents()
         self.refresh_fishing_alerts()
@@ -462,13 +464,52 @@ class DesktopController:
         except Exception as exc:
             self.window.show_error(str(exc))
 
-    def delete_fishing_alert(self, alert_id: int) -> None:
+    def delete_fishing_alert(self, alert_ids: list[int]) -> None:
         try:
-            self.fishing_service.delete_alert(self._current_db_path(), alert_id)
-            self.window.append_log(f"Deleted alert {alert_id}.")
+            if isinstance(alert_ids, int):
+                alert_ids = [alert_ids]
+            selected_ids = [int(alert_id) for alert_id in alert_ids if int(alert_id or 0)]
+            if not selected_ids:
+                return
+            db_path = self._current_db_path()
+            for alert_id in selected_ids:
+                self.fishing_service.delete_alert(db_path, alert_id)
+            self.window.append_log(f"Deleted {len(selected_ids)} alert(s): {', '.join(map(str, selected_ids))}.")
             self.refresh_fishing_alerts()
         except Exception as exc:
             self.window.show_error(str(exc))
+
+    def start_review_alerts(self) -> None:
+        if self._review_alerts_task and not self._review_alerts_task.done():
+            self.window.show_error("REVIEW 复核正在运行。")
+            return
+        self._review_alerts_task = asyncio.create_task(self._run_review_alerts())
+
+    async def _run_review_alerts(self) -> None:
+        self.window.set_fishing_review_running(True)
+        self.window.append_log("REVIEW 复核开始。")
+        try:
+            result = await asyncio.to_thread(
+                self.service.review_database_alerts,
+                self._current_db_path(),
+            )
+            self.window.append_log(
+                f"REVIEW 复核完成: total={result.total_review_items}, updated={result.updated_items}."
+            )
+            if result.review_results_file:
+                self.window.append_log(f"Review results file: {result.review_results_file}")
+            self.refresh_fishing_alerts()
+            self._log_llm_usage()
+            self.window.show_info(
+                "复核完成",
+                f"已复核 {result.total_review_items} 条 REVIEW 商品，LLM 返回 {result.updated_items} 条结果。",
+            )
+        except Exception as exc:
+            self.window.append_log(f"REVIEW 复核失败: {exc}")
+            self.window.show_error(str(exc))
+        finally:
+            self.window.set_fishing_review_running(False)
+            self._review_alerts_task = None
 
     def _find_fishing_alert(self, alert_id: int):
         for alert in self.fishing_service.list_alerts(self._current_db_path()):

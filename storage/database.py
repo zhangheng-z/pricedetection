@@ -46,6 +46,8 @@ class Database:
                     sales_count INTEGER,
                     search_keyword TEXT DEFAULT '',
                     search_run_id INTEGER DEFAULT 0,
+                    spec_capture_mode TEXT DEFAULT '',
+                    spec_capture_info TEXT DEFAULT '',
                     created_at TEXT DEFAULT (datetime('now', 'localtime')),
                     FOREIGN KEY (search_run_id) REFERENCES search_runs(id)
                 );
@@ -61,6 +63,8 @@ class Database:
                     judgment TEXT NOT NULL,
                     reason TEXT DEFAULT '',
                     status TEXT DEFAULT 'pending',
+                    spec_capture_mode TEXT DEFAULT '',
+                    spec_capture_info TEXT DEFAULT '',
                     created_at TEXT DEFAULT (datetime('now', 'localtime')),
                     FOREIGN KEY (listing_id) REFERENCES listings(id)
                 );
@@ -126,9 +130,21 @@ class Database:
                 conn.execute(
                     "ALTER TABLE fishing_messages ADD COLUMN listing_id INTEGER NOT NULL DEFAULT 0"
                 )
+            self._ensure_column(conn, "listings", "spec_capture_mode", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "listings", "spec_capture_info", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "price_alerts", "spec_capture_mode", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "price_alerts", "spec_capture_info", "TEXT DEFAULT ''")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_fishing_messages_listing ON fishing_messages(listing_id)"
             )
+
+    def _ensure_column(self, conn, table: str, column: str, definition: str) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def save_run(self, run: SearchRun) -> int:
         with self._get_conn() as conn:
@@ -147,12 +163,14 @@ class Database:
             try:
                 cur = conn.execute(
                     """INSERT INTO listings (platform, product_name, title, price,
-                       seller_name, url, thumbnail, sales_count, search_keyword, search_run_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       seller_name, url, thumbnail, sales_count, search_keyword, search_run_id,
+                       spec_capture_mode, spec_capture_info)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (listing.platform, listing.product_name, listing.title,
                      listing.price, listing.seller_name, listing.url,
                      listing.thumbnail, listing.sales_count,
-                     listing.search_keyword, listing.search_run_id),
+                     listing.search_keyword, listing.search_run_id,
+                     listing.spec_capture_mode, listing.spec_capture_info),
                 )
                 return cur.lastrowid
             except sqlite3.IntegrityError:
@@ -164,6 +182,24 @@ class Database:
                 ).fetchone()
                 if not existing:
                     raise
+                conn.execute(
+                    """
+                    UPDATE listings
+                    SET price = ?, seller_name = ?, thumbnail = ?, search_keyword = ?,
+                        search_run_id = ?, spec_capture_mode = ?, spec_capture_info = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        listing.price,
+                        listing.seller_name,
+                        listing.thumbnail,
+                        listing.search_keyword,
+                        listing.search_run_id,
+                        listing.spec_capture_mode,
+                        listing.spec_capture_info,
+                        existing["id"],
+                    ),
+                )
                 return int(existing["id"])
 
     def save_alert(self, alert: PriceAlert) -> int:
@@ -176,21 +212,25 @@ class Database:
                 conn.execute(
                     """UPDATE price_alerts
                        SET platform = ?, product_name = ?, title = ?, price = ?,
-                           official_price = ?, judgment = ?, reason = ?, status = ?
+                           official_price = ?, judgment = ?, reason = ?, status = ?,
+                           spec_capture_mode = ?, spec_capture_info = ?
                        WHERE id = ?""",
                     (alert.platform, alert.product_name, alert.title, alert.price,
                      alert.official_price, alert.judgment, alert.reason, alert.status,
+                     alert.spec_capture_mode, alert.spec_capture_info,
                      existing["id"]),
                 )
                 return int(existing["id"])
 
             cur = conn.execute(
                 """INSERT INTO price_alerts (listing_id, platform, product_name,
-                   title, price, official_price, judgment, reason, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   title, price, official_price, judgment, reason, status,
+                   spec_capture_mode, spec_capture_info)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (alert.listing_id, alert.platform, alert.product_name,
                  alert.title, alert.price, alert.official_price,
-                 alert.judgment, alert.reason, alert.status),
+                 alert.judgment, alert.reason, alert.status,
+                 alert.spec_capture_mode, alert.spec_capture_info),
             )
             return cur.lastrowid
 
@@ -246,6 +286,8 @@ class Database:
                     a.judgment,
                     a.reason,
                     a.status,
+                    COALESCE(NULLIF(a.spec_capture_mode, ''), l.spec_capture_mode, '') AS spec_capture_mode,
+                    COALESCE(NULLIF(a.spec_capture_info, ''), l.spec_capture_info, '') AS spec_capture_info,
                     a.created_at,
                     l.seller_name,
                     l.url,
@@ -267,7 +309,8 @@ class Database:
                       'seller_replied',
                       'manual_required',
                       'failed',
-                      'evidence_collected'
+                      'evidence_collected',
+                      'resolved'
                   )
                   AND a.judgment IN ('VIOLATION', 'SUSPECTED', 'DELIST', 'REVIEW')
                 ORDER BY
@@ -281,6 +324,35 @@ class Database:
                     a.price ASC,
                     a.created_at DESC,
                     a.id DESC
+                """
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_review_alerts(self) -> List[dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    a.id AS alert_id,
+                    a.listing_id,
+                    a.platform,
+                    a.product_name,
+                    a.title,
+                    a.price,
+                    a.official_price,
+                    a.judgment,
+                    a.reason,
+                    a.status,
+                    COALESCE(NULLIF(a.spec_capture_mode, ''), l.spec_capture_mode, '') AS spec_capture_mode,
+                    COALESCE(NULLIF(a.spec_capture_info, ''), l.spec_capture_info, '') AS spec_capture_info,
+                    a.created_at,
+                    l.seller_name,
+                    l.url,
+                    l.thumbnail
+                FROM price_alerts a
+                JOIN listings l ON l.id = a.listing_id
+                WHERE UPPER(a.judgment) = 'REVIEW'
+                ORDER BY a.created_at DESC, a.id DESC
                 """
             ).fetchall()
             return [dict(row) for row in rows]
@@ -362,6 +434,8 @@ class Database:
                     a.judgment,
                     a.reason,
                     a.status,
+                    COALESCE(NULLIF(a.spec_capture_mode, ''), l.spec_capture_mode, '') AS spec_capture_mode,
+                    COALESCE(NULLIF(a.spec_capture_info, ''), l.spec_capture_info, '') AS spec_capture_info,
                     l.seller_name,
                     l.url,
                     l.thumbnail

@@ -2049,7 +2049,7 @@ class XianyuAgent(BaseAgent):
 
         if not offers:
             return None
-        return min(offers, key=lambda offer: offer["price"])
+        return offers[0]
 
     async def _collect_xianyu_order_options(self, page: Page, intent: Dict[str, str]) -> Dict[str, Any]:
         return await page.evaluate(
@@ -2070,14 +2070,19 @@ class XianyuAgent(BaseAgent):
                     return Number.isFinite(price) ? price : null;
                 };
                 const dayPattern = (days) => new RegExp(`${days}(?:\u5929|\u65e5|day|days)`, 'i');
+                const monthPattern = /(?:^|[^\u9001\u8d60])(?:\d+\u4e2a\u6708|[一二三四五六七八九十]+\u4e2a\u6708|\d+\u6708\u4f1a\u5458|[一二三四五六七八九十]+\u6708\u4f1a\u5458)/i;
+                const quarterPattern = /(?:\u5b63\u5361|\u5b63\u4f1a\u5458|\u4e09\u4e2a\u6708|\u4e09\u6708\u4f1a\u5458|3\u4e2a\u6708|3\u6708\u4f1a\u5458)/i;
                 const yearPattern = /(?:\u5e74\u5361|\u5e74\u4f1a\u5458|\u4e00\u5e74\u5361|\u4e24\u5e74\u5361|1\u5e74\u5361|2\u5e74\u5361|\u4e00\u5e74|\u4e24\u5e74|1\u5e74|2\u5e74|12\u4e2a\u6708|365\u5929)/i;
                 const hasSpecToken = (value) => dayPattern(7).test(value) ||
-                    dayPattern(15).test(value) || dayPattern(21).test(value) || yearPattern.test(value);
+                    dayPattern(15).test(value) || dayPattern(21).test(value) ||
+                    monthPattern.test(value) || quarterPattern.test(value) || yearPattern.test(value);
                 const specKinds = (value) => {
                     const kinds = [];
                     if (dayPattern(7).test(value)) kinds.push('7d');
                     if (dayPattern(15).test(value)) kinds.push('15d');
                     if (dayPattern(21).test(value)) kinds.push('21d');
+                    if (monthPattern.test(value)) kinds.push('month');
+                    if (quarterPattern.test(value)) kinds.push('quarter');
                     if (yearPattern.test(value)) kinds.push('year');
                     return kinds;
                 };
@@ -2135,6 +2140,9 @@ class XianyuAgent(BaseAgent):
                     score -= Math.max(0, value.length - 24) / 4;
                     return score;
                 };
+                const directSpecChildCount = (el) => Array.from(el.children || [])
+                    .filter((child) => visible(child) && hasSpecToken(norm(child.innerText || child.textContent || '')))
+                    .length;
 
                 const selector = [
                     'button',
@@ -2179,7 +2187,7 @@ class XianyuAgent(BaseAgent):
                     const optionTextHasSpec = hasSpecToken(key);
                     const optionTextMatchesIntent = specMatches(key);
                     const optionSpecKinds = specKinds(key);
-                    const optionLooksLikeContainer = optionSpecKinds.length > 1;
+                    const optionLooksLikeContainer = optionSpecKinds.length > 1 || directSpecChildCount(clickEl) >= 2;
                     const optionSoldOut = isSoldOut(clickEl, text || rawText);
 
                     if (optionLooksClickable && optionTextHasSpec && !optionLooksLikeContainer && !optionSeen.has(key)) {

@@ -292,6 +292,8 @@ class BaseAgent:
                 thumbnail=item.get("thumbnail", ""),
                 search_keyword=keyword,
                 search_run_id=run_id,
+                spec_capture_mode=order_offer.get("spec_capture_mode", ""),
+                spec_capture_info=order_offer.get("spec_capture_info", ""),
             )
             listing_id = self.db.save_listing(listing)
             listing.id = listing_id
@@ -329,6 +331,8 @@ class BaseAgent:
                     official_price=self.product.official_price,
                     judgment=decision,
                     reason=self.price_judge.format_analysis_reason(analysis),
+                    spec_capture_mode=order_offer.get("spec_capture_mode", ""),
+                    spec_capture_info=order_offer.get("spec_capture_info", ""),
                 )
                 self.db.save_alert(alert)
                 self.collected_listings.append(listing)

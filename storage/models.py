@@ -16,6 +16,8 @@ class Listing:
     sales_count: Optional[int] = None  # 销量
     search_keyword: str = "" # 搜索使用的关键词
     search_run_id: int = 0   # 关联的搜索批次
+    spec_capture_mode: str = ""  # 规格采集模式
+    spec_capture_info: str = ""  # 规格采集信息
     created_at: str = ""     # 记录时间
     id: int = 0              # 数据库主键
 
@@ -32,6 +34,8 @@ class PriceAlert:
     judgment: str            # violation | suspicious
     reason: str = ""
     status: str = "pending"  # pending | fishing | resolved
+    spec_capture_mode: str = ""
+    spec_capture_info: str = ""
     created_at: str = ""
     id: int = 0              # 数据库主键
 

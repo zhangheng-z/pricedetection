@@ -93,6 +93,13 @@ class RunSummary:
         return sum(result.alerts for result in self.run_results)
 
 
+@dataclass
+class ReviewAlertsResult:
+    total_review_items: int
+    updated_items: int
+    review_results_file: str = ""
+
+
 class _StdoutTee(io.TextIOBase):
     def __init__(self, original, callback: Optional[Callable[[str], None]] = None):
         self.original = original
@@ -183,6 +190,78 @@ class MonitorService:
         yaml.safe_load(updated_settings or "")
         path.write_text(updated_settings, encoding="utf-8")
         self.load_runtime_config()
+
+    def review_database_alerts(self, db_path: str) -> ReviewAlertsResult:
+        tee = _StdoutTee(sys.stdout, self.log_callback)
+        with redirect_stdout(tee):
+            try:
+                result = self._review_database_alerts_internal(db_path)
+                tee.flush()
+                return result
+            finally:
+                tee.flush()
+
+    def _review_database_alerts_internal(self, db_path: str) -> ReviewAlertsResult:
+        settings: Settings = self.config_loader.load_settings()
+        if not settings.llm.api_key:
+            raise ValueError("LLM API key not configured.")
+
+        db = Database(db_path)
+        alerts = db.list_review_alerts()
+        if not alerts:
+            print("No REVIEW alerts found.", flush=True)
+            return ReviewAlertsResult(total_review_items=0, updated_items=0)
+
+        run_results = self._review_alerts_to_run_results(alerts)
+        llm = LLMClient(settings.llm)
+        review_results_file, review_payload = self._save_review_results(run_results, llm)
+        self._apply_review_results(run_results, review_payload, db)
+        updated_items = self._count_review_decisions(review_payload)
+        if review_results_file:
+            print(f"Review results file: {review_results_file}", flush=True)
+        print(
+            f"Review alerts finished: total={len(alerts)}, updated={updated_items}",
+            flush=True,
+        )
+        return ReviewAlertsResult(
+            total_review_items=len(alerts),
+            updated_items=updated_items,
+            review_results_file=review_results_file,
+        )
+
+    def _review_alerts_to_run_results(self, alerts: List[dict]) -> List[ProductRunResult]:
+        results_by_key: Dict[tuple[str, str], ProductRunResult] = {}
+        for alert in alerts:
+            platform = str(alert.get("platform") or "")
+            product = str(alert.get("product_name") or "")
+            key = (platform, product)
+            result = results_by_key.get(key)
+            if result is None:
+                result = ProductRunResult(
+                    platform=platform,
+                    product=product,
+                    listings=0,
+                    alerts=0,
+                    account="database",
+                )
+                results_by_key[key] = result
+            result.items.append({
+                "title": alert.get("title", ""),
+                "price": alert.get("price", 0),
+                "url": alert.get("url", ""),
+                "judgment": alert.get("judgment", ""),
+                "spec_capture_mode": alert.get("spec_capture_mode", ""),
+                "spec_capture_info": alert.get("spec_capture_info", ""),
+            })
+            result.listings += 1
+            result.alerts += 1
+        return list(results_by_key.values())
+
+    def _count_review_decisions(self, review_payload: Dict[str, Any]) -> int:
+        count = 0
+        for batch in review_payload.get("batches", []):
+            count += sum(1 for result in batch.get("results", []) if isinstance(result, dict))
+        return count
 
     def list_accounts(self) -> List[dict]:
         config = self.load_runtime_config()
