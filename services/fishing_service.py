@@ -84,13 +84,29 @@ class FishingService:
         "short_term_low_price",
         "uncertain",
     }
+    JUDGMENTS = {"VIOLATION", "SUSPECTED", "DELIST", "REVIEW", "NORMAL"}
 
-    def update_alert_status(self, db_path: str, alert_id: int, status: str, product_type: str = "") -> None:
+    def update_alert_status(
+        self,
+        db_path: str,
+        alert_id: int,
+        status: str,
+        product_type: str = "",
+        judgment: str = "",
+    ) -> None:
         if status not in self.ALERT_STATUSES:
             raise ValueError(f"Unsupported alert status: {status}")
         if product_type not in self.PRODUCT_TYPES:
             raise ValueError(f"Unsupported product type: {product_type}")
-        if not Database(db_path).update_alert_status_and_product_type(alert_id, status, product_type):
+        judgment = str(judgment or "").upper()
+        if judgment not in self.JUDGMENTS:
+            raise ValueError(f"Unsupported judgment: {judgment}")
+        if not Database(db_path).update_alert_judgment_status_and_product_type(
+            alert_id,
+            judgment,
+            status,
+            product_type,
+        ):
             raise ValueError(f"Alert not found: {alert_id}")
 
     def delete_alert(self, db_path: str, alert_id: int) -> None:

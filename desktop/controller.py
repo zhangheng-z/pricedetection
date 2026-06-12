@@ -456,16 +456,23 @@ class DesktopController:
             )
         self.window.show_result_details("询价会话", "\n".join(lines))
 
-    def update_fishing_status(self, alert_id: int, status: str, product_type: str = "") -> None:
+    def update_fishing_status(
+        self,
+        alert_id: int,
+        judgment: str,
+        status: str,
+        product_type: str = "",
+    ) -> None:
         try:
             self.fishing_service.update_alert_status(
                 self._current_db_path(),
                 alert_id,
                 status,
                 product_type,
+                judgment,
             )
             self.window.append_log(
-                f"Updated alert {alert_id} status to {status}, product_type={product_type or '-'}."
+                f"Updated alert {alert_id} judgment={judgment}, product_type={product_type or '-'}, status={status}."
             )
             self.refresh_fishing_alerts()
         except Exception as exc:

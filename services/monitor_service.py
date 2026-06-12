@@ -562,8 +562,6 @@ class MonitorService:
 
         for result in run_results:
             for item in result.items:
-                if str(item.get("judgment", "")).upper() == "NORMAL":
-                    continue
                 url = item.get("url", "")
                 key = url or f"{item.get('title', '')}|{item.get('price', '')}"
                 if key in seen_urls:
@@ -742,7 +740,7 @@ class MonitorService:
                 if not url:
                     continue
                 if final_decision == "NORMAL":
-                    db.delete_alert_by_url(url)
+                    db.update_alert_judgment_by_url(url, "NORMAL", review_reason)
                     continue
                 if final_decision in {"VIOLATION", "SUSPECTED", "DELIST", "REVIEW"}:
                     db.update_alert_judgment_by_url(url, final_decision, review_reason)

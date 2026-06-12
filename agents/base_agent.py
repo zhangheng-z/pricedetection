@@ -313,6 +313,13 @@ class BaseAgent:
                 analysis["reason"] = "\u53ef\u552e\u89c4\u683c\u547d\u4e2d\u9002\u8da3AI\u4e2d\u65877\u5929\uff0c\u9700\u4e0b\u67b6"
             decision = str(analysis.get("decision", "UNKNOWN"))
 
+            if decision == "NORMAL":
+                setattr(listing, "judgment", decision)
+                setattr(listing, "spec_capture_mode", order_offer.get("spec_capture_mode", ""))
+                setattr(listing, "spec_capture_info", order_offer.get("spec_capture_info", ""))
+                self.collected_listings.append(listing)
+                continue
+
             if decision in {"VIOLATION", "SUSPECTED", "REVIEW", "DELIST"}:
                 print(
                     f"[{self.PLATFORM}] price alert candidate: {decision} "

@@ -67,8 +67,10 @@ FISHING_STATUS_LABELS = {
 
 FISHING_JUDGMENT_LABELS = {
     "VIOLATION": "乱价",
+    "SUSPECTED": "疑似引流",
     "DELIST": "需下架",
     "REVIEW": "需人工复核",
+    "NORMAL": "正常",
 }
 
 FISHING_PRODUCT_TYPE_LABELS = {
@@ -95,7 +97,7 @@ class MainWindow(QMainWindow):
     fishing_start_requested = Signal(int)
     fishing_open_listing_requested = Signal(int)
     fishing_messages_requested = Signal(int)
-    fishing_status_update_requested = Signal(int, str, str)
+    fishing_status_update_requested = Signal(int, str, str, str)
     fishing_delete_requested = Signal(list)
     fishing_batch_start_requested = Signal(list)
     fishing_batch_stop_requested = Signal()
@@ -163,6 +165,7 @@ class MainWindow(QMainWindow):
         self.fishing_refresh_button.setText("刷新线索")
         self.fishing_messages_button.setText("查看会话")
         self.fishing_headless_checkbox.setText("无头模式")
+        self.fishing_review_button.setText("LLM复核")
         self.fishing_batch_start_button.setText("批量钓鱼")
         self.fishing_batch_stop_button.setText("停止批量")
 
@@ -641,16 +644,16 @@ class MainWindow(QMainWindow):
         self.fishing_messages_button = QPushButton("查看会话", page)
         self.fishing_headless_checkbox = QCheckBox("无头模式", page)
         self.fishing_headless_checkbox.setChecked(True)
-        self.fishing_review_button = QPushButton("复核 REVIEW", page)
+        self.fishing_review_button = QPushButton("LLM复核", page)
         self.fishing_batch_start_button = QPushButton("批量钓鱼", page)
         self.fishing_batch_stop_button = QPushButton("停止批量", page)
         actions.addWidget(self.fishing_refresh_button)
         actions.addWidget(self.fishing_messages_button)
         actions.addWidget(self.fishing_headless_checkbox)
-        actions.addWidget(self.fishing_review_button)
         actions.addWidget(self.fishing_batch_start_button)
         actions.addWidget(self.fishing_batch_stop_button)
         actions.addStretch(1)
+        actions.addWidget(self.fishing_review_button)
         actions_bar = QWidget(page)
         actions_bar.setLayout(actions)
         actions_bar.setFixedHeight(45)
@@ -1107,7 +1110,7 @@ class MainWindow(QMainWindow):
         self.fishing_product_type_filter.blockSignals(True)
         self.fishing_product_type_filter.clear()
         self.fishing_product_type_filter.addItem("全部乱价类型", "")
-        self.fishing_product_type_filter.addItem("未处理", "__empty__")
+        self.fishing_product_type_filter.addItem("-", "__empty__")
         for product_type in values:
             self.fishing_product_type_filter.addItem(
                 FISHING_PRODUCT_TYPE_LABELS.get(product_type, product_type),
@@ -1258,6 +1261,17 @@ class MainWindow(QMainWindow):
         status_combo.setCurrentIndex(status_index if status_index >= 0 else 0)
         return status_combo
 
+    def _build_fishing_judgment_widget(self, judgment: str) -> QComboBox:
+        judgment_combo = QComboBox(self.fishing_table)
+        normalized = str(judgment or "").upper()
+        for judgment_value in FISHING_JUDGMENT_LABELS:
+            judgment_combo.addItem(self._display_fishing_judgment(judgment_value), judgment_value)
+        if normalized and judgment_combo.findData(normalized) < 0:
+            judgment_combo.addItem(self._display_fishing_judgment(normalized), normalized)
+        judgment_index = judgment_combo.findData(normalized)
+        judgment_combo.setCurrentIndex(judgment_index if judgment_index >= 0 else 0)
+        return judgment_combo
+
     def _build_fishing_product_type_widget(self, product_type: str, payment_status: str = "") -> QComboBox:
         product_type_combo = QComboBox(self.fishing_table)
         product_type_combo.addItem("-", "")
@@ -1275,6 +1289,7 @@ class MainWindow(QMainWindow):
     def _build_fishing_operation_widget(
         self,
         alert_id: int,
+        judgment_combo: QComboBox,
         status_combo: QComboBox,
         product_type_combo: QComboBox,
     ) -> QWidget:
@@ -1289,9 +1304,14 @@ class MainWindow(QMainWindow):
         update_button.setFixedSize(46, 22)
         self._refresh_widget_style(update_button)
         update_button.clicked.connect(
-            lambda _checked=False, row_alert_id=alert_id, status=status_combo, product_type=product_type_combo:
+            lambda _checked=False,
+            row_alert_id=alert_id,
+            judgment=judgment_combo,
+            status=status_combo,
+            product_type=product_type_combo:
             self.fishing_status_update_requested.emit(
                 row_alert_id,
+                str(judgment.currentData() or ""),
                 str(status.currentData() or ""),
                 str(product_type.currentData() or ""),
             )
@@ -1303,7 +1323,12 @@ class MainWindow(QMainWindow):
         delete_button.setFixedSize(46, 22)
         self._refresh_widget_style(delete_button)
         delete_button.clicked.connect(
-            lambda _checked=False, row_alert_id=alert_id: self._emit_row_fishing_delete(row_alert_id)
+            lambda _checked=False,
+            row_alert_id=alert_id,
+            judgment=judgment_combo: self._emit_row_fishing_delete(
+                row_alert_id,
+                str(judgment.currentData() or ""),
+            )
         )
         layout.addWidget(delete_button)
 
@@ -1380,6 +1405,8 @@ class MainWindow(QMainWindow):
                         self._apply_fishing_product_type_style(item, product_type, payment_status)
                     self.fishing_table.setItem(row_index, column_index + 1, item)
                 product_type_widget = self._build_fishing_product_type_widget(product_type, payment_status)
+                judgment_widget = self._build_fishing_judgment_widget(judgment)
+                self.fishing_table.setCellWidget(row_index, 7, judgment_widget)
                 self.fishing_table.setCellWidget(row_index, 8, product_type_widget)
                 status_widget = self._build_fishing_status_widget(str(alert.get("status", "")))
                 self.fishing_table.setCellWidget(row_index, 9, status_widget)
@@ -1395,6 +1422,7 @@ class MainWindow(QMainWindow):
 
                 operation_widget = self._build_fishing_operation_widget(
                     alert_id,
+                    judgment_widget,
                     status_widget,
                     product_type_widget,
                 )
@@ -1604,17 +1632,32 @@ class MainWindow(QMainWindow):
             return
         self._confirm_and_emit_fishing_delete(alert_ids)
 
-    def _emit_row_fishing_delete(self, alert_id: int) -> None:
+    def _emit_row_fishing_delete(self, alert_id: int, judgment: str = "") -> None:
         if alert_id:
-            self._confirm_and_emit_fishing_delete([alert_id])
+            self._confirm_and_emit_fishing_delete([alert_id], judgment)
 
-    def _confirm_and_emit_fishing_delete(self, alert_ids: list[int]) -> None:
+    def _confirm_and_emit_fishing_delete(self, alert_ids: list[int], row_judgment: str = "") -> None:
         count = len(alert_ids)
+        alert_id_set = {int(alert_id) for alert_id in alert_ids if int(alert_id or 0)}
+        has_normal = (
+            str(row_judgment or "").upper() == "NORMAL"
+            or any(
+                int(alert.get("alert_id") or 0) in alert_id_set
+                and str(alert.get("judgment", "")).upper() == "NORMAL"
+                for alert in self._fishing_alerts
+            )
+        )
         message = (
             f"确定删除选中的 {count} 条商品线索吗？相关询价会话记录也会一并删除。"
             if count > 1
             else "确定删除这条商品线索吗？相关询价会话记录也会一并删除。"
         )
+        if has_normal:
+            message += (
+                "\n\n注意：判断为“正常”的商品通常是从“需人工复核”状态，"
+                "经由 LLM 审核或人工审核后改为正常。删除后，下次检测仍会再次检测到该商品，"
+                "并可能重新判定为“需人工复核”。"
+            )
         reply = QMessageBox.question(
             self,
             "删除商品",

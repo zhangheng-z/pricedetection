@@ -318,7 +318,7 @@ class Database:
                       'evidence_collected',
                       'resolved'
                   )
-                  AND a.judgment IN ('VIOLATION', 'SUSPECTED', 'DELIST', 'REVIEW')
+                  AND a.judgment IN ('VIOLATION', 'SUSPECTED', 'DELIST', 'REVIEW', 'NORMAL')
                 ORDER BY
                     CASE a.product_name
                         WHEN '适趣 AI 中文15天' THEN 1
@@ -388,16 +388,17 @@ class Database:
     def update_alert_judgment_by_url(self, url: str, judgment: str, reason: str = "") -> bool:
         if not url:
             return False
+        status = "resolved" if str(judgment or "").upper() == "NORMAL" else "pending"
         with self._get_conn() as conn:
             cur = conn.execute(
                 """
                 UPDATE price_alerts
-                SET judgment = ?, reason = ?, status = 'pending'
+                SET judgment = ?, reason = ?, status = ?
                 WHERE listing_id IN (
                     SELECT id FROM listings WHERE url = ?
                 )
                 """,
-                (judgment, reason, url),
+                (judgment, reason, status, url),
             )
             return cur.rowcount > 0
 
@@ -646,6 +647,39 @@ class Database:
                 WHERE id = ?
                 """,
                 (status, product_type, product_type, status, product_type, alert_id),
+            )
+            return cur.rowcount > 0
+
+    def update_alert_judgment_status_and_product_type(
+        self,
+        alert_id: int,
+        judgment: str,
+        status: str,
+        product_type: str,
+    ) -> bool:
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE price_alerts
+                SET judgment = ?,
+                    status = ?,
+                    product_type = ?,
+                    payment_status = CASE
+                        WHEN ? = 'channel_resale' AND ? = 'resolved' THEN 'paid'
+                        WHEN ? = 'channel_resale' THEN 'unpaid'
+                        ELSE ''
+                    END
+                WHERE id = ?
+                """,
+                (
+                    judgment,
+                    status,
+                    product_type,
+                    product_type,
+                    status,
+                    product_type,
+                    alert_id,
+                ),
             )
             return cur.rowcount > 0
 
