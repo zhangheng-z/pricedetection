@@ -4,3 +4,8 @@ reports/
 __pycache__/
 *.pyc
 venv/
+dist/
+build/
+packaging/installer/output/
+*.spec 
+*.db

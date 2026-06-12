@@ -262,11 +262,11 @@ class SearchEngine:
                         }
                     ],
                 )
+                self.llm.record_usage(response)
                 text = response.content[0].text.strip()
             else:
-                client = self.llm._get_openai_client()
-                response = client.chat.completions.create(
-                    model=self.llm.config.model,
+                response = self.llm.create_openai_chat_completion(
+                    model=self.llm.current_model(),
                     messages=[
                         {
                             "role": "user",
@@ -281,6 +281,7 @@ class SearchEngine:
                     ],
                     temperature=0,
                 )
+                self.llm.record_usage(response)
                 text = response.choices[0].message.content.strip()
 
             if text and text != "null":

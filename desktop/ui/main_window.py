@@ -1,11 +1,14 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
+    QAbstractSpinBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -15,6 +18,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -23,27 +27,96 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+import yaml
 
+
+LLM_PRESETS = {
+    "VectorEngine": {
+        "provider": "openai_compatible",
+        "model": "deepseek-v4-flash",
+        "api_base": "https://api.vectorengine.ai/v1",
+        "api_key": "${VECTORENGINE_API_KEY}",
+    },
+    "自定义 OpenAI-compatible": {
+        "provider": "openai_compatible",
+        "model": "",
+        "api_base": "",
+        "api_key": "",
+    },
+}
+
+FISHING_ALERT_STATUSES = [
+    "pending",
+    "fishing",
+    "waiting_seller",
+    "seller_replied",
+    "manual_required",
+    "failed",
+    "resolved",
+]
+
+FISHING_STATUS_LABELS = {
+    "pending": "待处理",
+    "fishing": "钓鱼中",
+    "waiting_seller": "等待商家回复",
+    "seller_replied": "商家已回复",
+    "manual_required": "需人工处理",
+    "failed": "失败",
+    "resolved": "成功",
+}
+
+FISHING_JUDGMENT_LABELS = {
+    "VIOLATION": "乱价",
+    "DELIST": "需下架",
+    "REVIEW": "需人工复核",
+}
+
+FISHING_PRODUCT_TYPE_LABELS = {
+    "gray_account": "灰产账号型",
+    "channel_resale": "渠道贩卖型",
+    "personal_transfer": "个人闲置转让型",
+    "short_term_low_price": "短期低价型",
+    "uncertain": "不确定",
+}
 
 class MainWindow(QMainWindow):
     start_requested = Signal(dict)
     stop_requested = Signal()
     refresh_requested = Signal()
     save_config_requested = Signal(dict)
+    save_llm_config_requested = Signal(dict)
     open_file_requested = Signal(str)
     open_account_storage_requested = Signal(str)
     open_account_storage_dir_requested = Signal(str)
     result_details_requested = Signal(int)
     open_login_requested = Signal(str)
     save_login_state_requested = Signal(str)
+    fishing_refresh_requested = Signal()
+    fishing_start_requested = Signal(int)
+    fishing_open_listing_requested = Signal(int)
+    fishing_messages_requested = Signal(int)
+    fishing_status_update_requested = Signal(int, str, str)
+    fishing_delete_requested = Signal(list)
+    fishing_batch_start_requested = Signal(list)
+    fishing_batch_stop_requested = Signal()
+    fishing_review_requested = Signal()
 
     def __init__(self):
         super().__init__()
         self._accounts = []
+        self._fishing_alerts = []
+        self._filtered_fishing_alerts = []
+        self._fishing_page_size = 15
+        self._fishing_current_page = 1
+        self._fishing_batch_running = False
         self._login_session_active = False
         self.setWindowTitle("Price Detection Desktop")
-        self.resize(1220, 860)
+        self.resize(1180, 720)
         self._build_ui()
+        self._localize_text()
+        self._apply_styles()
+        self._style_tables()
+        self._set_button_roles()
         self._set_output_button(self.open_deduped_button, "")
         self._set_output_button(self.open_report_button, "")
         self._set_output_button(self.open_output_dir_button, "")
@@ -53,19 +126,320 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget(self)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
 
-        header = QLabel("桌面控制台")
-        header.setStyleSheet("font-size: 24px; font-weight: 600;")
+        header = QLabel("价格监控工作台")
+        header.setStyleSheet("font-size: 15pt; font-weight: 700; color: #0F172A;")
         layout.addWidget(header)
 
         tabs = QTabWidget(self)
         tabs.addTab(self._build_run_tab(), "运行")
-        tabs.addTab(self._build_config_tab(), "配置")
+        tabs.addTab(self._build_fishing_tab(), "钓鱼")
         layout.addWidget(tabs)
 
         self.setCentralWidget(central)
+
+    def _localize_text(self) -> None:
+        self.setWindowTitle("价格监控工作台")
+
+        tabs = self.findChildren(QTabWidget)
+        if tabs:
+            tabs[0].setTabText(0, "监控运行")
+            tabs[0].setTabText(1, "钓鱼")
+
+        self.start_button.setText("开始运行")
+        self.stop_button.setText("停止任务")
+        self.refresh_button.setText("刷新配置")
+        self.headless_checkbox.setText("无头模式")
+        self.open_login_button.setText("打开登录窗口")
+        self.save_login_state_button.setText("完成登录并保存")
+        self.open_account_storage_button.setText("打开登录态文件")
+        self.open_account_storage_dir_button.setText("打开登录态目录")
+        self.open_deduped_button.setText("打开汇总结果")
+        self.open_report_button.setText("打开日报文件")
+        self.open_output_dir_button.setText("打开输出目录")
+
+        self.fishing_refresh_button.setText("刷新线索")
+        self.fishing_messages_button.setText("查看会话")
+        self.fishing_headless_checkbox.setText("无头模式")
+        self.fishing_batch_start_button.setText("批量钓鱼")
+        self.fishing_batch_stop_button.setText("停止批量")
+
+        if hasattr(self, "save_llm_config_button"):
+            self.save_llm_config_button.setText("保存模型配置")
+        if hasattr(self, "reload_llm_config_button"):
+            self.reload_llm_config_button.setText("重新加载")
+
+        self.account_table.setHorizontalHeaderLabels(["平台", "账号", "状态", "已保存", "最近保存时间", "存档路径"])
+        self.results_table.setHorizontalHeaderLabels(["平台", "商品", "账号", "采集数", "告警数"])
+        self.fishing_table.setHorizontalHeaderLabels([
+            "选择",
+            "序号",
+            "商品",
+            "标题",
+            "卖家",
+            "页面价",
+            "官方价",
+            "判断",
+            "乱价类型",
+            "处理状态",
+            "创建时间",
+            "商品链接",
+            "操作",
+        ])
+        self._set_status_label("空闲", "idle")
+
+    def _apply_styles(self) -> None:
+        self.setStyleSheet("""
+            QMainWindow, QWidget {
+                background: #F6F7F9;
+                color: #1F2937;
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "SimHei", "Segoe UI";
+                font-size: 9pt;
+            }
+            QTabWidget::pane {
+                border: 1px solid #E5E7EB;
+                border-radius: 8px;
+                background: #FFFFFF;
+                top: -1px;
+            }
+            QTabBar::tab {
+                background: transparent;
+                color: #64748B;
+                padding: 7px 16px;
+                margin-right: 4px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+            }
+            QTabBar::tab:selected {
+                background: #FFFFFF;
+                color: #0F766E;
+                font-weight: 600;
+                border: 1px solid #E5E7EB;
+                border-bottom-color: #FFFFFF;
+            }
+            QGroupBox {
+                background: #FFFFFF;
+                border: 1px solid #E5E7EB;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding: 10px 10px 8px 10px;
+                font-weight: 600;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                color: #0F172A;
+            }
+            QLineEdit, QComboBox, QDoubleSpinBox, QPlainTextEdit {
+                background: #FFFFFF;
+                border: 1px solid #D6DAE1;
+                border-radius: 6px;
+                padding: 4px 7px;
+                selection-background-color: #99F6E4;
+            }
+            QLineEdit:disabled {
+                background: #F1F5F9;
+                color: #64748B;
+                border-color: #D6DAE1;
+            }
+            QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QPlainTextEdit:focus {
+                border-color: #0F766E;
+            }
+            QPushButton {
+                min-height: 26px;
+                padding: 4px 10px;
+                border-radius: 6px;
+                border: 1px solid #CBD5E1;
+                background: #FFFFFF;
+                color: #334155;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background: #F8FAFC;
+                border-color: #94A3B8;
+            }
+            QPushButton:disabled {
+                color: #94A3B8;
+                background: #F1F5F9;
+                border-color: #E2E8F0;
+            }
+            QPushButton[role="primary"] {
+                background: #0F766E;
+                border-color: #0F766E;
+                color: #FFFFFF;
+                font-weight: 600;
+            }
+            QPushButton[role="primary"]:hover {
+                background: #115E59;
+                border-color: #115E59;
+            }
+            QPushButton[role="danger"] {
+                color: #B91C1C;
+                border-color: #FCA5A5;
+                background: #FFF7F7;
+            }
+            QPushButton[role="danger"]:hover {
+                background: #FEE2E2;
+            }
+            QPushButton[role="small"] {
+                min-height: 22px;
+                max-height: 22px;
+                padding: 2px 8px;
+                font-size: 8pt;
+                font-weight: 400;
+                background: transparent;
+                color: #475569;
+                border-color: transparent;
+            }
+            QPushButton[role="small"]:hover {
+                background: #EFF6FF;
+                color: #1D4ED8;
+                border-color: #BFDBFE;
+            }
+            QPushButton[role="small"]:pressed {
+                background: #DBEAFE;
+                color: #1E40AF;
+                border-color: #93C5FD;
+            }
+            QPushButton[role="small-danger"] {
+                min-height: 22px;
+                max-height: 22px;
+                padding: 2px 8px;
+                font-size: 8pt;
+                font-weight: 400;
+                background: transparent;
+                color: #B91C1C;
+                border-color: transparent;
+            }
+            QPushButton[role="small-danger"]:hover {
+                background: #FEF2F2;
+                color: #991B1B;
+                border-color: #FECACA;
+            }
+            QPushButton[role="small-danger"]:pressed {
+                background: #FEE2E2;
+                color: #7F1D1D;
+                border-color: #FCA5A5;
+            }
+            QTableWidget {
+                background: #FFFFFF;
+                alternate-background-color: #F8FAFC;
+                gridline-color: #E5E7EB;
+                border: 1px solid #E5E7EB;
+                border-radius: 6px;
+                selection-background-color: #DBEAFE;
+                selection-color: #0F172A;
+                outline: 0;
+            }
+            QTableWidget:focus {
+                outline: 0;
+            }
+            QHeaderView::section {
+                background: #F1F5F9;
+                color: #334155;
+                padding: 5px 6px;
+                border: 0;
+                border-right: 1px solid #E2E8F0;
+                font-weight: 600;
+            }
+            QTableWidget::item {
+                padding: 4px;
+                border: 0;
+                outline: 0;
+            }
+            QTableWidget::item:hover {
+                background: #F8FAFC;
+                color: #1F2937;
+            }
+            QTableWidget::item:selected {
+                background: #DBEAFE;
+                color: #0F172A;
+                border: 0;
+                outline: 0;
+            }
+            QTableWidget::item:selected:active {
+                background: #DBEAFE;
+                color: #0F172A;
+                border: 0;
+                outline: 0;
+            }
+            QTableWidget::item:selected:!active {
+                background: #E0F2FE;
+                color: #0F172A;
+                border: 0;
+                outline: 0;
+            }
+            QPlainTextEdit {
+                font-family: Consolas, "Microsoft YaHei UI", "Microsoft YaHei", "SimHei";
+                font-size: 8pt;
+            }
+            QLabel[state="idle"] {
+                color: #475569;
+                background: #F1F5F9;
+                border: 1px solid #E2E8F0;
+                border-radius: 11px;
+                padding: 3px 10px;
+                font-weight: 600;
+            }
+            QLabel[state="running"] {
+                color: #1D4ED8;
+                background: #EFF6FF;
+                border: 1px solid #BFDBFE;
+                border-radius: 11px;
+                padding: 3px 10px;
+                font-weight: 600;
+            }
+            QLabel[state="success"] {
+                color: #047857;
+                background: #ECFDF5;
+                border: 1px solid #A7F3D0;
+                border-radius: 11px;
+                padding: 3px 10px;
+                font-weight: 600;
+            }
+            QLabel[state="warning"] {
+                color: #B45309;
+                background: #FFFBEB;
+                border: 1px solid #FDE68A;
+                border-radius: 11px;
+                padding: 3px 10px;
+                font-weight: 600;
+            }
+        """)
+
+    def _style_tables(self) -> None:
+        for table in [self.account_table, self.results_table, self.fishing_table]:
+            table.setAlternatingRowColors(True)
+            table.setFocusPolicy(Qt.NoFocus)
+            table.verticalHeader().setDefaultSectionSize(30)
+            table.horizontalHeader().setHighlightSections(False)
+
+    def _set_button_roles(self) -> None:
+        roles = {
+            self.start_button: "primary",
+            self.fishing_batch_start_button: "primary",
+            self.stop_button: "danger",
+            self.fishing_batch_stop_button: "danger",
+        }
+        if hasattr(self, "save_llm_config_button"):
+            roles[self.save_llm_config_button] = "primary"
+        for button, role in roles.items():
+            button.setProperty("role", role)
+            self._refresh_widget_style(button)
+
+    def _set_status_label(self, text: str, state: str) -> None:
+        self.status_label.setText(text)
+        self.status_label.setProperty("state", state)
+        self.status_label.setFixedWidth(max(72, len(text) * 18))
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self._refresh_widget_style(self.status_label)
+
+    def _refresh_widget_style(self, widget: QWidget) -> None:
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
 
     def _build_run_tab(self) -> QWidget:
         page = QWidget(self)
@@ -88,16 +462,13 @@ class MainWindow(QMainWindow):
         run_group = QGroupBox("运行参数", panel)
         run_form = QFormLayout(run_group)
         self.platform_combo = QComboBox(run_group)
-        self.platform_combo.addItem("all")
+        self.platform_combo.addItem("xianyu")
         run_form.addRow("平台", self.platform_combo)
         self.db_path_input = QLineEdit("data/price_monitor.db", run_group)
+        self.db_path_input.setEnabled(False)
         run_form.addRow("数据库", self.db_path_input)
         self.headless_checkbox = QCheckBox("无头模式", run_group)
-        self.debug_fast_checkbox = QCheckBox("调试加速", run_group)
-        self.dry_run_checkbox = QCheckBox("仅 dry-run", run_group)
         run_form.addRow("", self.headless_checkbox)
-        run_form.addRow("", self.debug_fast_checkbox)
-        run_form.addRow("", self.dry_run_checkbox)
         layout.addWidget(run_group)
 
         runtime_group = QGroupBox("运行时信息", panel)
@@ -105,14 +476,20 @@ class MainWindow(QMainWindow):
         self.provider_label = QLabel("-", runtime_group)
         self.products_label = QLabel("-", runtime_group)
         self.accounts_label = QLabel("-", runtime_group)
+        self.token_usage_label = QLabel("-", runtime_group)
         self.products_label.setWordWrap(True)
         self.accounts_label.setWordWrap(True)
+        self.token_usage_label.setWordWrap(True)
+        self.products_label.setMaximumHeight(36)
+        self.accounts_label.setMaximumHeight(36)
         runtime_layout.addWidget(QLabel("模型", runtime_group))
         runtime_layout.addWidget(self.provider_label)
         runtime_layout.addWidget(QLabel("商品", runtime_group))
         runtime_layout.addWidget(self.products_label)
         runtime_layout.addWidget(QLabel("账号", runtime_group))
         runtime_layout.addWidget(self.accounts_label)
+        runtime_layout.addWidget(QLabel("Token", runtime_group))
+        runtime_layout.addWidget(self.token_usage_label)
         layout.addWidget(runtime_group)
 
         login_group = QGroupBox("账号登录", panel)
@@ -124,6 +501,7 @@ class MainWindow(QMainWindow):
 
         login_hint = QLabel("点击“打开登录窗口”后在浏览器里完成登录，再回到这里点击“完成登录并保存”。", login_group)
         login_hint.setWordWrap(True)
+        login_hint.setMaximumHeight(42)
         login_form.addRow("", login_hint)
 
         login_actions = QHBoxLayout()
@@ -142,6 +520,7 @@ class MainWindow(QMainWindow):
         self.account_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.account_table.verticalHeader().setVisible(False)
         self.account_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.account_table.setMaximumHeight(120)
         account_layout.addWidget(self.account_table)
 
         account_actions = QHBoxLayout()
@@ -179,26 +558,24 @@ class MainWindow(QMainWindow):
     def _build_output_panel(self) -> QWidget:
         panel = QWidget(self)
         layout = QVBoxLayout(panel)
-        layout.setSpacing(12)
+        layout.setSpacing(8)
 
         summary_group = QGroupBox("运行摘要", panel)
-        summary_layout = QVBoxLayout(summary_group)
+        summary_layout = QFormLayout(summary_group)
+        summary_layout.setLabelAlignment(Qt.AlignRight)
+        summary_layout.setHorizontalSpacing(12)
+        summary_layout.setVerticalSpacing(6)
         self.status_label = QLabel("空闲", summary_group)
         self.started_label = QLabel("-", summary_group)
         self.finished_label = QLabel("-", summary_group)
         self.totals_label = QLabel("-", summary_group)
         self.report_label = QLabel("-", summary_group)
         self.report_label.setWordWrap(True)
-        summary_layout.addWidget(QLabel("状态", summary_group))
-        summary_layout.addWidget(self.status_label)
-        summary_layout.addWidget(QLabel("开始时间", summary_group))
-        summary_layout.addWidget(self.started_label)
-        summary_layout.addWidget(QLabel("结束时间", summary_group))
-        summary_layout.addWidget(self.finished_label)
-        summary_layout.addWidget(QLabel("统计", summary_group))
-        summary_layout.addWidget(self.totals_label)
-        summary_layout.addWidget(QLabel("输出文件", summary_group))
-        summary_layout.addWidget(self.report_label)
+        summary_layout.addRow("状态", self.status_label)
+        summary_layout.addRow("开始时间", self.started_label)
+        summary_layout.addRow("结束时间", self.finished_label)
+        summary_layout.addRow("统计", self.totals_label)
+        summary_layout.addRow("输出文件", self.report_label)
 
         output_actions = QHBoxLayout()
         self.open_deduped_button = QPushButton("打开汇总结果", summary_group)
@@ -207,7 +584,9 @@ class MainWindow(QMainWindow):
         output_actions.addWidget(self.open_deduped_button)
         output_actions.addWidget(self.open_report_button)
         output_actions.addWidget(self.open_output_dir_button)
-        summary_layout.addLayout(output_actions)
+        summary_layout.addRow("", self._wrap_layout(output_actions, summary_group))
+        summary_group.setMinimumHeight(235)
+        summary_group.setMaximumHeight(260)
         layout.addWidget(summary_group)
 
         result_group = QGroupBox("本次结果", panel)
@@ -217,13 +596,24 @@ class MainWindow(QMainWindow):
         self.results_table.horizontalHeader().setStretchLastSection(True)
         self.results_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.results_table.setMinimumHeight(160)
         result_layout.addWidget(self.results_table)
-        layout.addWidget(result_group)
+        layout.addWidget(result_group, 1)
 
         log_group = QGroupBox("运行日志", panel)
         log_layout = QVBoxLayout(log_group)
+        log_actions = QHBoxLayout()
+        log_actions.addStretch(1)
+        self.clear_log_button = QPushButton("清空日志", log_group)
+        self.clear_log_button.setProperty("role", "small")
+        self._refresh_widget_style(self.clear_log_button)
+        self.clear_log_button.setStyleSheet("min-height: 22px; max-height: 22px; padding: 0 8px;")
+        self.clear_log_button.setFixedSize(72, 22)
+        log_actions.addWidget(self.clear_log_button)
+        log_layout.addLayout(log_actions)
         self.log_output = QPlainTextEdit(log_group)
         self.log_output.setReadOnly(True)
+        self.log_output.setMaximumHeight(150)
         log_layout.addWidget(self.log_output)
         layout.addWidget(log_group)
 
@@ -236,8 +626,157 @@ class MainWindow(QMainWindow):
         self.open_output_dir_button.clicked.connect(
             lambda: self.open_file_requested.emit(self.open_output_dir_button.property("path") or "")
         )
+        self.clear_log_button.clicked.connect(self.clear_log)
         self.results_table.cellDoubleClicked.connect(lambda row, _column: self.result_details_requested.emit(row))
         return panel
+
+    def _build_fishing_tab(self) -> QWidget:
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        actions = QHBoxLayout()
+        self.fishing_refresh_button = QPushButton("刷新线索", page)
+        self.fishing_messages_button = QPushButton("查看会话", page)
+        self.fishing_headless_checkbox = QCheckBox("无头模式", page)
+        self.fishing_headless_checkbox.setChecked(True)
+        self.fishing_review_button = QPushButton("复核 REVIEW", page)
+        self.fishing_batch_start_button = QPushButton("批量钓鱼", page)
+        self.fishing_batch_stop_button = QPushButton("停止批量", page)
+        actions.addWidget(self.fishing_refresh_button)
+        actions.addWidget(self.fishing_messages_button)
+        actions.addWidget(self.fishing_headless_checkbox)
+        actions.addWidget(self.fishing_review_button)
+        actions.addWidget(self.fishing_batch_start_button)
+        actions.addWidget(self.fishing_batch_stop_button)
+        actions.addStretch(1)
+        actions_bar = QWidget(page)
+        actions_bar.setLayout(actions)
+        actions_bar.setFixedHeight(45)
+        layout.addWidget(actions_bar)
+
+        filters = QHBoxLayout()
+        filters.addWidget(QLabel("商品", page))
+        self.fishing_product_filter = QComboBox(page)
+        filters.addWidget(self.fishing_product_filter)
+        filters.addWidget(QLabel("页面价", page))
+        self.fishing_price_sort_combo = QComboBox(page)
+        self.fishing_price_sort_combo.addItems(["默认排序", "从低到高", "从高到低"])
+        filters.addWidget(self.fishing_price_sort_combo)
+        filters.addWidget(QLabel("判断", page))
+        self.fishing_judgment_filter = QComboBox(page)
+        filters.addWidget(self.fishing_judgment_filter)
+        filters.addWidget(QLabel("乱价类型", page))
+        self.fishing_product_type_filter = QComboBox(page)
+        filters.addWidget(self.fishing_product_type_filter)
+        filters.addWidget(QLabel("处理状态", page))
+        self.fishing_table_status_filter = QComboBox(page)
+        filters.addWidget(self.fishing_table_status_filter)
+        filters.addWidget(QLabel("创建时间", page))
+        self.fishing_created_filter = QComboBox(page)
+        self.fishing_created_filter.addItems(["全部时间", "今天", "近7天", "近30天"])
+        filters.addWidget(self.fishing_created_filter)
+        self.fishing_clear_filters_button = QPushButton("重置", page)
+        filters.addWidget(self.fishing_clear_filters_button)
+        filters.addStretch(1)
+        filters_bar = QWidget(page)
+        filters_bar.setLayout(filters)
+        filters_bar.setFixedHeight(45)
+        layout.addWidget(filters_bar)
+
+        self.fishing_table = QTableWidget(0, 13, page)
+        self.fishing_table.setHorizontalHeaderLabels([
+            "选择",
+            "序号",
+            "商品",
+            "标题",
+            "卖家",
+            "页面价",
+            "官方价",
+            "判断",
+            "乱价类型",
+            "处理状态",
+            "创建时间",
+            "商品链接",
+            "操作",
+        ])
+        self.fishing_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.fishing_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.fishing_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.fishing_table.verticalHeader().setVisible(False)
+        self.fishing_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.fishing_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.fishing_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
+        self.fishing_table.horizontalHeader().setSectionResizeMode(11, QHeaderView.Fixed)
+        self.fishing_table.horizontalHeader().setSectionResizeMode(12, QHeaderView.Fixed)
+        self.fishing_table.setColumnWidth(0, 46)
+        self.fishing_table.setColumnWidth(1, 52)
+        self.fishing_table.setColumnWidth(11, 68)
+        self.fishing_table.setColumnWidth(12, 168)
+        self.fishing_table.setFixedHeight(486)
+        self.fishing_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        layout.addWidget(self.fishing_table)
+
+        pagination = QHBoxLayout()
+        pagination.setContentsMargins(0, 0, 0, 0)
+        pagination.setSpacing(8)
+        pagination.addStretch(1)
+        self.fishing_prev_page_button = QPushButton("上一页", page)
+        self.fishing_page_prefix_label = QLabel("第", page)
+        self.fishing_page_input = QSpinBox(page)
+        self.fishing_page_input.setRange(1, 1)
+        self.fishing_page_input.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.fishing_page_input.setFixedWidth(64)
+        self.fishing_page_suffix_label = QLabel("/ 1 页，共 0 条", page)
+        self.fishing_next_page_button = QPushButton("下一页", page)
+        pagination.addWidget(self.fishing_prev_page_button)
+        pagination.addWidget(self.fishing_page_prefix_label)
+        pagination.addWidget(self.fishing_page_input)
+        pagination.addWidget(self.fishing_page_suffix_label)
+        pagination.addWidget(self.fishing_next_page_button)
+        pagination_bar = QWidget(page)
+        pagination_bar.setLayout(pagination)
+        pagination_bar.setMaximumHeight(40)
+        layout.addWidget(pagination_bar)
+
+        self.fishing_log_output = QPlainTextEdit(page)
+        self.fishing_log_output.setReadOnly(True)
+        self.fishing_log_output.setMinimumHeight(80)
+        layout.addWidget(self.fishing_log_output, 1)
+
+        self.fishing_refresh_button.clicked.connect(self.fishing_refresh_requested.emit)
+        self.fishing_messages_button.clicked.connect(self._emit_selected_fishing_messages)
+        self.fishing_review_button.clicked.connect(self.fishing_review_requested.emit)
+        self.fishing_batch_start_button.clicked.connect(self._emit_selected_fishing_batch_start)
+        self.fishing_batch_stop_button.clicked.connect(self.fishing_batch_stop_requested.emit)
+        self.fishing_table.itemSelectionChanged.connect(self._sync_fishing_buttons)
+        self.fishing_table.itemChanged.connect(lambda _item: self._sync_fishing_buttons())
+        self.fishing_product_filter.currentTextChanged.connect(self._apply_fishing_filters)
+        self.fishing_price_sort_combo.currentTextChanged.connect(self._apply_fishing_filters)
+        self.fishing_judgment_filter.currentTextChanged.connect(self._apply_fishing_filters)
+        self.fishing_product_type_filter.currentTextChanged.connect(self._apply_fishing_filters)
+        self.fishing_table_status_filter.currentTextChanged.connect(self._apply_fishing_filters)
+        self.fishing_created_filter.currentTextChanged.connect(self._apply_fishing_filters)
+        self.fishing_clear_filters_button.clicked.connect(self._reset_fishing_filters)
+        self.fishing_prev_page_button.clicked.connect(self._go_previous_fishing_page)
+        self.fishing_next_page_button.clicked.connect(self._go_next_fishing_page)
+        self.fishing_page_input.valueChanged.connect(self._go_fishing_page)
+        self.fishing_batch_stop_button.setEnabled(False)
+        self._sync_fishing_buttons()
+        return page
+
+    def fishing_headless_enabled(self) -> bool:
+        return self.fishing_headless_checkbox.isChecked()
+
+    def set_fishing_batch_running(self, running: bool) -> None:
+        self._fishing_batch_running = running
+        self.fishing_batch_start_button.setDisabled(running)
+        self.fishing_batch_stop_button.setEnabled(running)
+        self._sync_fishing_buttons()
+
+    def set_fishing_review_running(self, running: bool) -> None:
+        self.fishing_review_button.setDisabled(running)
 
     def _build_config_tab(self) -> QWidget:
         page = QWidget(self)
@@ -267,13 +806,64 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.config_tabs)
         return page
 
+    def _build_model_config_tab(self) -> QWidget:
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setSpacing(12)
+
+        model_group = QGroupBox("LLM 模型", page)
+        form = QFormLayout(model_group)
+
+        self.llm_preset_combo = QComboBox(model_group)
+        self.llm_preset_combo.addItems(list(LLM_PRESETS.keys()))
+        form.addRow("服务", self.llm_preset_combo)
+
+        self.llm_provider_input = QComboBox(model_group)
+        self.llm_provider_input.addItems(["openai_compatible"])
+        form.addRow("Provider", self.llm_provider_input)
+
+        self.llm_model_input = QComboBox(model_group)
+        self.llm_model_input.setEditable(True)
+        self.llm_model_input.addItems([
+            "deepseek-v4-flash",
+            "gpt-5.4-mini",
+        ])
+        form.addRow("模型", self.llm_model_input)
+
+        self.llm_api_base_input = QLineEdit(model_group)
+        form.addRow("API Base", self.llm_api_base_input)
+
+        self.llm_api_key_input = QLineEdit(model_group)
+        self.llm_api_key_input.setEchoMode(QLineEdit.Password)
+        form.addRow("API Key", self.llm_api_key_input)
+
+        self.llm_temperature_input = QDoubleSpinBox(model_group)
+        self.llm_temperature_input.setRange(0, 2)
+        self.llm_temperature_input.setSingleStep(0.1)
+        self.llm_temperature_input.setDecimals(2)
+        form.addRow("Temperature", self.llm_temperature_input)
+
+        actions = QHBoxLayout()
+        self.save_llm_config_button = QPushButton("保存模型配置", model_group)
+        self.reload_llm_config_button = QPushButton("重新加载", model_group)
+        actions.addWidget(self.save_llm_config_button)
+        actions.addWidget(self.reload_llm_config_button)
+        actions.addStretch(1)
+        form.addRow("", self._wrap_layout(actions, model_group))
+
+        layout.addWidget(model_group)
+        layout.addStretch(1)
+
+        self.llm_preset_combo.currentTextChanged.connect(self._apply_llm_preset)
+        self.save_llm_config_button.clicked.connect(self._emit_save_llm_config)
+        self.reload_llm_config_button.clicked.connect(self.refresh_requested.emit)
+        return page
+
     def set_platforms(self, platforms: list[str]) -> None:
         current = self.platform_combo.currentText()
         self.platform_combo.blockSignals(True)
         self.platform_combo.clear()
-        self.platform_combo.addItem("all")
-        for platform in platforms:
-            self.platform_combo.addItem(platform)
+        self.platform_combo.addItem("xianyu")
         index = self.platform_combo.findText(current)
         self.platform_combo.setCurrentIndex(index if index >= 0 else 0)
         self.platform_combo.blockSignals(False)
@@ -283,11 +873,19 @@ class MainWindow(QMainWindow):
         self.products_label.setText("，".join(products) if products else "无")
         self.accounts_label.setText("，".join(accounts) if accounts else "无")
 
+    def set_token_usage(self, usage: dict) -> None:
+        self.token_usage_label.setText(
+            f"requests={usage.get('requests', 0)}, "
+            f"prompt={usage.get('prompt_tokens', 0)}, "
+            f"completion={usage.get('completion_tokens', 0)}, "
+            f"total={usage.get('total_tokens', 0)}"
+        )
+
     def set_login_accounts(self, accounts: list[dict]) -> None:
-        self._accounts = accounts
+        self._accounts = [account for account in accounts if account["platform"] == "xianyu"]
         current_platform = self.login_platform_combo.currentText()
 
-        platforms = sorted({account["platform"] for account in accounts})
+        platforms = sorted({account["platform"] for account in self._accounts})
         self.login_platform_combo.blockSignals(True)
         self.login_platform_combo.clear()
         for platform in platforms:
@@ -299,6 +897,7 @@ class MainWindow(QMainWindow):
         self._refresh_login_account_combo()
 
     def set_account_statuses(self, accounts: list[dict]) -> None:
+        accounts = [account for account in accounts if account["platform"] == "xianyu"]
         self.account_table.setRowCount(len(accounts))
         for row_index, account in enumerate(accounts):
             values = [
@@ -317,7 +916,7 @@ class MainWindow(QMainWindow):
         self.start_button.setDisabled(running)
         self.stop_button.setEnabled(running)
         self.refresh_button.setDisabled(running)
-        self.status_label.setText("运行中" if running else "空闲")
+        self._set_status_label("运行中" if running else "空闲", "running" if running else "idle")
 
     def set_login_busy(self, busy: bool) -> None:
         self.open_login_button.setDisabled(busy or self._login_session_active)
@@ -337,7 +936,7 @@ class MainWindow(QMainWindow):
 
     def prepare_for_run(self) -> None:
         self.clear_log()
-        self.status_label.setText("准备中")
+        self._set_status_label("准备中", "warning")
         self.started_label.setText("-")
         self.finished_label.setText("-")
         self.totals_label.setText("-")
@@ -348,18 +947,22 @@ class MainWindow(QMainWindow):
         self._set_output_button(self.open_output_dir_button, "")
 
     def mark_run_stopped(self) -> None:
-        self.status_label.setText("已停止")
+        self._set_status_label("已停止", "warning")
         self.finished_label.setText(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     def append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_output.appendPlainText(f"[{timestamp}] {message}")
+        if hasattr(self, "fishing_log_output"):
+            self.fishing_log_output.appendPlainText(f"[{timestamp}] {message}")
 
     def clear_log(self) -> None:
         self.log_output.clear()
+        if hasattr(self, "fishing_log_output"):
+            self.fishing_log_output.clear()
 
     def show_summary(self, summary) -> None:
-        self.status_label.setText("完成")
+        self._set_status_label("已完成", "success")
         self.started_label.setText(summary.started_at.strftime("%Y-%m-%d %H:%M:%S"))
         self.finished_label.setText(summary.finished_at.strftime("%Y-%m-%d %H:%M:%S"))
         self.totals_label.setText(
@@ -404,18 +1007,410 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def set_config_documents(self, documents: dict) -> None:
+        settings_text = documents.get("settings.yaml")
+        if settings_text is not None and hasattr(self, "llm_provider_input"):
+            try:
+                settings = yaml.safe_load(settings_text) or {}
+                self.set_llm_config(settings.get("llm", {}))
+            except yaml.YAMLError as exc:
+                self.append_log(f"Failed to load model config: {exc}")
+
+        if not hasattr(self, "config_editors"):
+            return
         for filename, content in documents.items():
             editor = self.config_editors.get(filename)
             if editor is not None:
                 editor.setPlainText(content)
 
+    def set_llm_config(self, llm_config: dict) -> None:
+        provider = str(llm_config.get("provider") or "openai_compatible")
+        model = str(llm_config.get("model") or "")
+        api_base = str(llm_config.get("api_base") or "")
+        api_key = str(llm_config.get("api_key") or "")
+        temperature = float(llm_config.get("temperature", 0.7))
+
+        self.llm_provider_input.setCurrentText(provider)
+        if self.llm_model_input.findText(model) < 0:
+            self.llm_model_input.addItem(model)
+        self.llm_model_input.setCurrentText(model)
+        self.llm_api_base_input.setText(api_base)
+        self.llm_api_key_input.setText(api_key)
+        self.llm_temperature_input.setValue(temperature)
+
+        preset = self._llm_preset_for(provider, model, api_base)
+        if preset:
+            self.llm_preset_combo.blockSignals(True)
+            self.llm_preset_combo.setCurrentText(preset)
+            self.llm_preset_combo.blockSignals(False)
+
+    def set_fishing_alerts(self, alerts: list[dict]) -> None:
+        self._fishing_alerts = alerts
+        self._refresh_fishing_filter_options(alerts)
+        self._apply_fishing_filters()
+
+    def _refresh_fishing_filter_options(self, alerts: list[dict]) -> None:
+        self._set_filter_combo_items(
+            self.fishing_product_filter,
+            "全部商品",
+            sorted({str(alert.get("product_name", "")) for alert in alerts if alert.get("product_name")}),
+        )
+        self._set_judgment_filter_items(alerts)
+        self._set_product_type_filter_items(alerts)
+        self._set_status_filter_items()
+
+    def _set_filter_combo_items(self, combo: QComboBox, all_text: str, values: list[str]) -> None:
+        current = combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(all_text)
+        combo.addItems(values)
+        index = combo.findText(current)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _set_judgment_filter_items(self, alerts: list[dict]) -> None:
+        current = self.fishing_judgment_filter.currentData()
+        values = list(FISHING_JUDGMENT_LABELS)
+        for alert in alerts:
+            judgment = str(alert.get("judgment", "")).upper()
+            if judgment and judgment not in values:
+                values.append(judgment)
+
+        self.fishing_judgment_filter.blockSignals(True)
+        self.fishing_judgment_filter.clear()
+        self.fishing_judgment_filter.addItem("全部判断", "")
+        for judgment in values:
+            self.fishing_judgment_filter.addItem(self._display_fishing_judgment(judgment), judgment)
+        index = self.fishing_judgment_filter.findData(current)
+        self.fishing_judgment_filter.setCurrentIndex(index if index >= 0 else 0)
+        self.fishing_judgment_filter.blockSignals(False)
+
+    def _set_status_filter_items(self) -> None:
+        current = self.fishing_table_status_filter.currentData()
+        self.fishing_table_status_filter.blockSignals(True)
+        self.fishing_table_status_filter.clear()
+        self.fishing_table_status_filter.addItem("全部处理状态", "")
+        for status in FISHING_ALERT_STATUSES:
+            self.fishing_table_status_filter.addItem(self._display_fishing_status(status), status)
+        index = self.fishing_table_status_filter.findData(current)
+        self.fishing_table_status_filter.setCurrentIndex(index if index >= 0 else 0)
+        self.fishing_table_status_filter.blockSignals(False)
+
+    def _set_product_type_filter_items(self, alerts: list[dict]) -> None:
+        current = self.fishing_product_type_filter.currentData()
+        values = list(FISHING_PRODUCT_TYPE_LABELS)
+        for alert in alerts:
+            product_type = str(alert.get("product_type", "")).strip()
+            if product_type and product_type not in values:
+                values.append(product_type)
+
+        self.fishing_product_type_filter.blockSignals(True)
+        self.fishing_product_type_filter.clear()
+        self.fishing_product_type_filter.addItem("全部乱价类型", "")
+        self.fishing_product_type_filter.addItem("未处理", "__empty__")
+        for product_type in values:
+            self.fishing_product_type_filter.addItem(
+                FISHING_PRODUCT_TYPE_LABELS.get(product_type, product_type),
+                product_type,
+            )
+        index = self.fishing_product_type_filter.findData(current)
+        self.fishing_product_type_filter.setCurrentIndex(index if index >= 0 else 0)
+        self.fishing_product_type_filter.blockSignals(False)
+
+    def _apply_fishing_filters(self) -> None:
+        alerts = list(self._fishing_alerts)
+        product = self.fishing_product_filter.currentText()
+        judgment = self.fishing_judgment_filter.currentData()
+        product_type = self.fishing_product_type_filter.currentData()
+        status = self.fishing_table_status_filter.currentData()
+        created_index = self.fishing_created_filter.currentIndex()
+        price_sort_index = self.fishing_price_sort_combo.currentIndex()
+
+        if self.fishing_product_filter.currentIndex() > 0:
+            alerts = [alert for alert in alerts if str(alert.get("product_name", "")) == product]
+        if self.fishing_judgment_filter.currentIndex() > 0:
+            alerts = [
+                alert for alert in alerts
+                if str(alert.get("judgment", "")).upper() == str(judgment).upper()
+            ]
+        if self.fishing_product_type_filter.currentIndex() > 0:
+            if product_type == "__empty__":
+                alerts = [alert for alert in alerts if not str(alert.get("product_type", "")).strip()]
+            else:
+                alerts = [
+                    alert for alert in alerts
+                    if str(alert.get("product_type", "")).strip() == str(product_type)
+                ]
+        if self.fishing_table_status_filter.currentIndex() > 0:
+            alerts = [
+                alert for alert in alerts
+                if str(alert.get("status", "")) == str(status)
+            ]
+        if created_index > 0:
+            cutoff = self._fishing_created_cutoff(created_index)
+            if cutoff is not None:
+                alerts = [
+                    alert for alert in alerts
+                    if self._parse_fishing_created_at(alert.get("created_at", "")) >= cutoff
+                ]
+        if price_sort_index in (1, 2):
+            alerts.sort(
+                key=lambda alert: self._fishing_price_value(alert.get("price", "")),
+                reverse=price_sort_index == 2,
+            )
+
+        self._filtered_fishing_alerts = alerts
+        self._fishing_current_page = 1
+        self._render_current_fishing_page()
+
+    def _reset_fishing_filters(self) -> None:
+        for combo in [
+            self.fishing_product_filter,
+            self.fishing_judgment_filter,
+            self.fishing_product_type_filter,
+            self.fishing_table_status_filter,
+            self.fishing_created_filter,
+            self.fishing_price_sort_combo,
+        ]:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self._apply_fishing_filters()
+
+    def _fishing_total_pages(self) -> int:
+        if not self._filtered_fishing_alerts:
+            return 1
+        return max(1, (len(self._filtered_fishing_alerts) + self._fishing_page_size - 1) // self._fishing_page_size)
+
+    def _render_current_fishing_page(self) -> None:
+        total_pages = self._fishing_total_pages()
+        self._fishing_current_page = min(max(1, self._fishing_current_page), total_pages)
+        start = (self._fishing_current_page - 1) * self._fishing_page_size
+        end = start + self._fishing_page_size
+        self._render_fishing_alerts(self._filtered_fishing_alerts[start:end], start)
+        self._sync_fishing_pagination()
+
+    def _sync_fishing_pagination(self) -> None:
+        total = len(self._filtered_fishing_alerts)
+        total_pages = self._fishing_total_pages()
+        self.fishing_page_input.blockSignals(True)
+        self.fishing_page_input.setRange(1, total_pages)
+        self.fishing_page_input.setValue(self._fishing_current_page)
+        self.fishing_page_input.blockSignals(False)
+        self.fishing_page_suffix_label.setText(f"/ {total_pages} 页，共 {total} 条")
+        self.fishing_prev_page_button.setEnabled(self._fishing_current_page > 1)
+        self.fishing_next_page_button.setEnabled(self._fishing_current_page < total_pages)
+
+    def _go_fishing_page(self, page: int) -> None:
+        page = min(max(1, int(page)), self._fishing_total_pages())
+        if page == self._fishing_current_page:
+            return
+        self._fishing_current_page = page
+        self._render_current_fishing_page()
+
+    def _go_previous_fishing_page(self) -> None:
+        if self._fishing_current_page <= 1:
+            return
+        self._fishing_current_page -= 1
+        self._render_current_fishing_page()
+
+    def _go_next_fishing_page(self) -> None:
+        if self._fishing_current_page >= self._fishing_total_pages():
+            return
+        self._fishing_current_page += 1
+        self._render_current_fishing_page()
+
+    def _fishing_price_value(self, value) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _fishing_created_cutoff(self, index: int):
+        now = datetime.now()
+        if index == 1:
+            return now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if index == 2:
+            return now - timedelta(days=7)
+        if index == 3:
+            return now - timedelta(days=30)
+        return None
+
+    def _parse_fishing_created_at(self, value) -> datetime:
+        text = str(value or "").strip()
+        candidates = [
+            (text[:19], "%Y-%m-%d %H:%M:%S"),
+            (text[:19], "%Y-%m-%dT%H:%M:%S"),
+            (text[:10], "%Y-%m-%d"),
+        ]
+        for candidate, fmt in candidates:
+            try:
+                return datetime.strptime(candidate, fmt)
+            except ValueError:
+                continue
+        return datetime.min
+
+    def _build_fishing_status_widget(self, status: str) -> QComboBox:
+        status_combo = QComboBox(self.fishing_table)
+        for status_value in FISHING_ALERT_STATUSES:
+            status_combo.addItem(self._display_fishing_status(status_value), status_value)
+        status_index = status_combo.findData(status)
+        status_combo.setCurrentIndex(status_index if status_index >= 0 else 0)
+        return status_combo
+
+    def _build_fishing_product_type_widget(self, product_type: str, payment_status: str = "") -> QComboBox:
+        product_type_combo = QComboBox(self.fishing_table)
+        product_type_combo.addItem("-", "")
+        for type_value, label in FISHING_PRODUCT_TYPE_LABELS.items():
+            product_type_combo.addItem(label, type_value)
+        type_index = product_type_combo.findData(str(product_type or ""))
+        product_type_combo.setCurrentIndex(type_index if type_index >= 0 else 0)
+        if product_type == "channel_resale":
+            payment_label = "已付款" if payment_status == "paid" else "未付款"
+            product_type_combo.setItemText(product_type_combo.currentIndex(), f"渠道贩卖型（{payment_label}）")
+            color = "#15803d" if payment_status == "paid" else "#b91c1c"
+            product_type_combo.setStyleSheet(f"QComboBox {{ color: {color}; }}")
+        return product_type_combo
+
+    def _build_fishing_operation_widget(
+        self,
+        alert_id: int,
+        status_combo: QComboBox,
+        product_type_combo: QComboBox,
+    ) -> QWidget:
+        widget = QWidget(self.fishing_table)
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(4)
+        layout.setAlignment(Qt.AlignCenter)
+
+        update_button = QPushButton("更新", widget)
+        update_button.setProperty("role", "small")
+        update_button.setFixedSize(46, 22)
+        self._refresh_widget_style(update_button)
+        update_button.clicked.connect(
+            lambda _checked=False, row_alert_id=alert_id, status=status_combo, product_type=product_type_combo:
+            self.fishing_status_update_requested.emit(
+                row_alert_id,
+                str(status.currentData() or ""),
+                str(product_type.currentData() or ""),
+            )
+        )
+        layout.addWidget(update_button)
+
+        delete_button = QPushButton("删除", widget)
+        delete_button.setProperty("role", "small-danger")
+        delete_button.setFixedSize(46, 22)
+        self._refresh_widget_style(delete_button)
+        delete_button.clicked.connect(
+            lambda _checked=False, row_alert_id=alert_id: self._emit_row_fishing_delete(row_alert_id)
+        )
+        layout.addWidget(delete_button)
+
+        start_button = QPushButton("钓鱼", widget)
+        start_button.setProperty("role", "small")
+        start_button.setFixedSize(46, 22)
+        self._refresh_widget_style(start_button)
+        start_button.clicked.connect(
+            lambda _checked=False, row_alert_id=alert_id: self.fishing_start_requested.emit(row_alert_id)
+        )
+        layout.addWidget(start_button)
+        return widget
+
+    def _display_fishing_judgment(self, judgment: str) -> str:
+        normalized = str(judgment or "").upper()
+        return FISHING_JUDGMENT_LABELS.get(normalized, judgment)
+
+    def _display_fishing_status(self, status: str) -> str:
+        return FISHING_STATUS_LABELS.get(str(status or ""), status)
+
+    def _display_fishing_product_type(self, product_type: str, payment_status: str = "") -> str:
+        product_type = str(product_type or "").strip()
+        if not product_type:
+            return "-"
+        label = FISHING_PRODUCT_TYPE_LABELS.get(product_type, product_type)
+        if product_type == "channel_resale":
+            payment_label = "已付款" if payment_status == "paid" else "未付款"
+            return f"{label}（{payment_label}）"
+        return label
+
+    def _apply_fishing_product_type_style(self, item: QTableWidgetItem, product_type: str, payment_status: str) -> None:
+        if product_type != "channel_resale":
+            return
+        if payment_status == "paid":
+            item.setForeground(QColor("#15803d"))
+        else:
+            item.setForeground(QColor("#b91c1c"))
+
+    def _render_fishing_alerts(self, alerts: list[dict], start_index: int = 0) -> None:
+        self.fishing_table.setUpdatesEnabled(False)
+        self.fishing_table.blockSignals(True)
+        try:
+            self.fishing_table.setRowCount(len(alerts))
+            for row_index, alert in enumerate(alerts):
+                judgment = str(alert.get("judgment", ""))
+                product_type = str(alert.get("product_type", ""))
+                payment_status = str(alert.get("payment_status", ""))
+                values = [
+                    str(start_index + row_index + 1),
+                    alert.get("product_name", ""),
+                    alert.get("title", ""),
+                    alert.get("seller_name", ""),
+                    str(alert.get("price", "")),
+                    str(alert.get("official_price", "")),
+                    self._display_fishing_judgment(judgment),
+                    self._display_fishing_product_type(product_type, payment_status),
+                    alert.get("status", ""),
+                    alert.get("created_at", ""),
+                ]
+                alert_id = int(alert.get("alert_id") or 0)
+                check_item = QTableWidgetItem()
+                check_item.setData(Qt.UserRole, alert_id)
+                check_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
+                check_item.setCheckState(Qt.Unchecked)
+                self.fishing_table.setItem(row_index, 0, check_item)
+                for column_index, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if column_index == 0:
+                        item.setData(Qt.UserRole, alert_id)
+                    if column_index == 6:
+                        item.setData(Qt.UserRole, judgment.upper())
+                    if column_index == 7:
+                        item.setData(Qt.UserRole, product_type)
+                        self._apply_fishing_product_type_style(item, product_type, payment_status)
+                    self.fishing_table.setItem(row_index, column_index + 1, item)
+                product_type_widget = self._build_fishing_product_type_widget(product_type, payment_status)
+                self.fishing_table.setCellWidget(row_index, 8, product_type_widget)
+                status_widget = self._build_fishing_status_widget(str(alert.get("status", "")))
+                self.fishing_table.setCellWidget(row_index, 9, status_widget)
+
+                open_button = QPushButton("打开", self.fishing_table)
+                open_button.setProperty("role", "small")
+                open_button.setFixedSize(54, 22)
+                self._refresh_widget_style(open_button)
+                open_button.clicked.connect(
+                    lambda _checked=False, row_alert_id=alert_id: self.fishing_open_listing_requested.emit(row_alert_id)
+                )
+                self.fishing_table.setCellWidget(row_index, 11, open_button)
+
+                operation_widget = self._build_fishing_operation_widget(
+                    alert_id,
+                    status_widget,
+                    product_type_widget,
+                )
+                self.fishing_table.setCellWidget(row_index, 12, operation_widget)
+        finally:
+            self.fishing_table.blockSignals(False)
+            self.fishing_table.setUpdatesEnabled(True)
+        self._sync_fishing_buttons()
+
     def _emit_start_requested(self) -> None:
         self.start_requested.emit(
             {
                 "platform": self.platform_combo.currentText(),
-                "dry_run": self.dry_run_checkbox.isChecked(),
+                "dry_run": False,
                 "headless": self.headless_checkbox.isChecked(),
-                "debug_fast": self.debug_fast_checkbox.isChecked(),
+                "debug_fast": False,
                 "db_path": self.db_path_input.text().strip() or "data/price_monitor.db",
             }
         )
@@ -430,6 +1425,38 @@ class MainWindow(QMainWindow):
                 "content": editor.toPlainText(),
             }
         )
+
+    def _emit_save_llm_config(self) -> None:
+        self.save_llm_config_requested.emit(
+            {
+                "provider": self.llm_provider_input.currentText().strip(),
+                "model": self.llm_model_input.currentText().strip(),
+                "api_key": self.llm_api_key_input.text().strip(),
+                "api_base": self.llm_api_base_input.text().strip(),
+                "temperature": self.llm_temperature_input.value(),
+            }
+        )
+
+    def _apply_llm_preset(self, preset_name: str) -> None:
+        preset = LLM_PRESETS.get(preset_name)
+        if not preset:
+            return
+        self.llm_provider_input.setCurrentText(preset["provider"])
+        if preset["model"]:
+            self.llm_model_input.setCurrentText(preset["model"])
+        self.llm_api_base_input.setText(preset["api_base"])
+        if preset["api_key"]:
+            self.llm_api_key_input.setText(preset["api_key"])
+
+    def _llm_preset_for(self, provider: str, model: str, api_base: str) -> str:
+        for name, preset in LLM_PRESETS.items():
+            if (
+                preset["provider"] == provider
+                and preset["model"] == model
+                and preset["api_base"] == api_base
+            ):
+                return name
+        return "自定义 OpenAI-compatible"
 
     def _emit_open_login_requested(self) -> None:
         account_id = self.login_account_combo.currentData()
@@ -516,3 +1543,87 @@ class MainWindow(QMainWindow):
         item = self.account_table.item(row, 1)
         if item and item.text():
             self.open_account_storage_requested.emit(item.text())
+
+    def _selected_fishing_alert_id(self) -> int:
+        row = self.fishing_table.currentRow()
+        if row < 0:
+            return 0
+        return self._fishing_alert_id_for_row(row)
+
+    def _fishing_alert_id_for_row(self, row: int) -> int:
+        item = self.fishing_table.item(row, 0)
+        if item is None:
+            return 0
+        alert_id = item.data(Qt.UserRole)
+        try:
+            return int(alert_id or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _selected_fishing_alert_ids(self) -> list[int]:
+        checked_rows = []
+        for row in range(self.fishing_table.rowCount()):
+            item = self.fishing_table.item(row, 0)
+            if item is not None and item.checkState() == Qt.Checked:
+                checked_rows.append(row)
+
+        rows = []
+        if checked_rows:
+            rows = checked_rows
+        selection = self.fishing_table.selectionModel()
+        if not rows and selection is not None:
+            rows = sorted(index.row() for index in selection.selectedRows())
+        if not rows and self.fishing_table.currentRow() >= 0:
+            rows = [self.fishing_table.currentRow()]
+
+        alert_ids = []
+        seen = set()
+        for row in rows:
+            alert_id = self._fishing_alert_id_for_row(row)
+            if alert_id and alert_id not in seen:
+                seen.add(alert_id)
+                alert_ids.append(alert_id)
+        return alert_ids
+
+    def _sync_fishing_buttons(self) -> None:
+        has_alert = bool(self._selected_fishing_alert_id())
+        selected_alert_ids = self._selected_fishing_alert_ids()
+        self.fishing_messages_button.setEnabled(has_alert)
+        self.fishing_batch_start_button.setEnabled(
+            bool(selected_alert_ids) and not self._fishing_batch_running
+        )
+
+    def _emit_selected_fishing_messages(self) -> None:
+        alert_id = self._selected_fishing_alert_id()
+        if alert_id:
+            self.fishing_messages_requested.emit(alert_id)
+
+    def _emit_selected_fishing_delete(self) -> None:
+        alert_ids = self._selected_fishing_alert_ids()
+        if not alert_ids:
+            return
+        self._confirm_and_emit_fishing_delete(alert_ids)
+
+    def _emit_row_fishing_delete(self, alert_id: int) -> None:
+        if alert_id:
+            self._confirm_and_emit_fishing_delete([alert_id])
+
+    def _confirm_and_emit_fishing_delete(self, alert_ids: list[int]) -> None:
+        count = len(alert_ids)
+        message = (
+            f"确定删除选中的 {count} 条商品线索吗？相关询价会话记录也会一并删除。"
+            if count > 1
+            else "确定删除这条商品线索吗？相关询价会话记录也会一并删除。"
+        )
+        reply = QMessageBox.question(
+            self,
+            "删除商品",
+            message,
+        )
+        if reply == QMessageBox.Yes:
+            self.fishing_delete_requested.emit(alert_ids)
+
+    def _emit_selected_fishing_batch_start(self) -> None:
+        alert_ids = self._selected_fishing_alert_ids()
+        if alert_ids:
+            self.fishing_batch_start_requested.emit(alert_ids)

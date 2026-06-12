@@ -1,13 +1,17 @@
+import asyncio
+import json
 import random
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from agents.base_agent import BaseAgent
 from core.anti_detect import AntiDetect
+from core.browser import BrowserManager
 
 
 class XianyuAgent(BaseAgent):
@@ -198,6 +202,1227 @@ class XianyuAgent(BaseAgent):
             return "；".join(items)
 
         return ""
+
+    def _build_fishing_browser(self, headless: bool) -> BrowserManager:
+        return BrowserManager(
+            proxy=self.proxy,
+            headless=headless,
+            storage_state=self.account.storage_state or None,
+            user_data_dir=self.account.user_data_dir or None,
+            browser_channel=self.account.browser_channel or "msedge",
+            browser_backend=getattr(self.anti_risk, "browser_backend", "cloakbrowser"),
+            cloak_stealth_args=bool(getattr(self.anti_risk, "cloak_stealth_args", True)),
+            cloak_humanize=bool(getattr(self.anti_risk, "cloak_humanize", True)),
+            cloak_human_preset=getattr(self.anti_risk, "cloak_human_preset", "careful"),
+            cloak_binary_path=getattr(self.anti_risk, "cloak_binary_path", "") or None,
+            cloak_start_timeout_seconds=int(getattr(self.anti_risk, "cloak_start_timeout_seconds", 120)),
+            stealth_mode=bool(getattr(self.anti_risk, "stealth_mode", False)),
+            randomize_user_agent=bool(getattr(self.anti_risk, "randomize_user_agent", False)),
+            randomize_viewport=bool(getattr(self.anti_risk, "randomize_viewport", False)),
+        )
+
+    async def _load_fishing_account_cookies(self) -> None:
+        if self.browser and not self.account.storage_state and self.account.cookies_encrypted:
+            await self.browser.load_cookie_header(self.account.cookies_encrypted, self._cookie_url())
+
+    async def _open_fishing_detail_page(self, url: str) -> Page:
+        if not self.browser:
+            raise RuntimeError("Fishing browser is not started.")
+
+        print(f"[{self.PLATFORM}] fishing opening new page", flush=True)
+        page = await asyncio.wait_for(self.browser.new_page(), timeout=15)
+        print(f"[{self.PLATFORM}] fishing goto listing: {url}", flush=True)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        except PlaywrightTimeoutError:
+            print(f"[{self.PLATFORM}] fishing goto timed out, continue with current page: {page.url}", flush=True)
+        print(f"[{self.PLATFORM}] fishing detail page loaded: {page.url}", flush=True)
+        return page
+
+    async def start_chat_for_listing(self, url: str) -> Page:
+        self.browser = self._build_fishing_browser(self.headless)
+        print(f"[{self.PLATFORM}] fishing browser starting", flush=True)
+        await self.browser.start()
+        print(f"[{self.PLATFORM}] fishing browser started", flush=True)
+        await self._load_fishing_account_cookies()
+
+        page = await self._open_fishing_detail_page(url)
+        await self._wait_for_verification_appearance(page, "after fishing detail open", timeout_seconds=3)
+        page = await self._ensure_fishing_login(page, url)
+        print(f"[{self.PLATFORM}] fishing clicking chat button", flush=True)
+        if not await self._click_chat_button(page):
+            await self._save_fishing_debug_snapshot(page, "chat_button_not_found")
+            raise RuntimeError("未找到咸鱼商品详情页的聊一聊按钮")
+        print(f"[{self.PLATFORM}] fishing chat button clicked", flush=True)
+        await self._wait_for_fishing_page_stable(page, timeout=5000)
+        await AntiDetect.random_delay(1, 2)
+        await self._wait_for_verification_appearance(page, "after fishing chat open", timeout_seconds=3)
+        page = await self._resolve_chat_page(page)
+        if not await self._has_chat_input(page):
+            if await self._is_login_required_page(page):
+                page = await self._ensure_fishing_login(page, url)
+                await self._wait_for_fishing_page_stable(page, timeout=5000)
+                if not await self._has_chat_input(page):
+                    if not await self._click_chat_button(page):
+                        await self._save_fishing_debug_snapshot(page, "chat_button_not_found_after_login")
+                        raise RuntimeError("Login finished, but chat button was not found.")
+                    await self._wait_for_fishing_page_stable(page, timeout=5000)
+                    await AntiDetect.random_delay(1, 2)
+                    page = await self._resolve_chat_page(page)
+            if await self._has_chat_input(page):
+                print(f"[{self.PLATFORM}] fishing chat page ready: {page.url}", flush=True)
+                return page
+            await self._save_fishing_debug_snapshot(page, "chat_page_not_ready")
+            await self._save_fishing_input_diagnostics(page, reason="chat_page_not_ready")
+            raise RuntimeError("已点击聊天入口，但未检测到聊天输入框")
+        print(f"[{self.PLATFORM}] fishing chat page ready: {page.url}", flush=True)
+        return page
+
+    async def _ensure_fishing_login(self, page: Page, url: str) -> Page:
+        if not await self._is_login_required_page(page):
+            return page
+
+        if self.headless:
+            print(
+                f"[{self.PLATFORM}] login required in headless fishing mode. "
+                "Switching to a visible browser for manual login.",
+                flush=True,
+            )
+            page = await self._restart_fishing_browser_visible(url)
+        else:
+            print(
+                f"[{self.PLATFORM}] login required. Please finish login in the visible browser.",
+                flush=True,
+            )
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
+
+        await self._wait_for_manual_fishing_login(page)
+        await self._save_fishing_login_state(page)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        except PlaywrightTimeoutError:
+            print(f"[{self.PLATFORM}] fishing reload after login timed out: {page.url}", flush=True)
+        await self._wait_for_fishing_page_stable(page, timeout=5000)
+        await self._wait_for_verification_appearance(page, "after fishing login", timeout_seconds=3)
+        return page
+
+    async def _restart_fishing_browser_visible(self, url: str) -> Page:
+        if self.browser:
+            await self.browser.stop()
+        self.headless = False
+        self.browser = self._build_fishing_browser(False)
+        print(f"[{self.PLATFORM}] fishing visible login browser starting", flush=True)
+        await self.browser.start()
+        print(f"[{self.PLATFORM}] fishing visible login browser started", flush=True)
+        await self._load_fishing_account_cookies()
+        page = await self._open_fishing_detail_page(url)
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        return page
+
+    async def _wait_for_manual_fishing_login(self, page: Page) -> None:
+        wait_seconds = 0
+        while True:
+            if page.is_closed():
+                raise RuntimeError("Login browser was closed before login finished.")
+            if not await self._is_login_required_page(page):
+                break
+            await asyncio.sleep(5)
+            wait_seconds += 5
+            if wait_seconds % 30 == 0:
+                print(f"[{self.PLATFORM}] still waiting for manual login ({wait_seconds}s).", flush=True)
+
+        print(f"[{self.PLATFORM}] login state detected; resuming fishing.", flush=True)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        await AntiDetect.random_delay(1, 2)
+
+    async def _save_fishing_login_state(self, page: Page) -> None:
+        if not self.account.storage_state:
+            return
+        try:
+            storage_state = Path(self.account.storage_state)
+            storage_state.parent.mkdir(parents=True, exist_ok=True)
+            await page.context.storage_state(path=str(storage_state))
+            print(f"[{self.PLATFORM}] saved login state: {storage_state}", flush=True)
+        except Exception as exc:
+            print(f"[{self.PLATFORM}] failed to save login state: {exc}", flush=True)
+
+    async def _is_login_required_page(self, page: Page) -> bool:
+        try:
+            current_url = (page.url or "").lower()
+            if any(marker in current_url for marker in ("login.taobao.com", "passport", "/member/login")):
+                return True
+            return bool(
+                await page.evaluate(
+                    r"""
+                    () => {
+                        const visible = (el) => {
+                            const rect = el.getBoundingClientRect();
+                            const style = window.getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 &&
+                                style.visibility !== 'hidden' &&
+                                style.display !== 'none' &&
+                                Number(style.opacity || 1) > 0;
+                        };
+                        const text = (document.body?.innerText || '').replace(/\s+/g, '');
+                        const strongMarkers = [
+                            '\u5bc6\u7801\u767b\u5f55',
+                            '\u77ed\u4fe1\u767b\u5f55',
+                            '\u9a8c\u8bc1\u7801\u767b\u5f55',
+                            '\u6dd8\u5b9d\u8d26\u53f7\u767b\u5f55',
+                            '\u8bf7\u5148\u767b\u5f55',
+                            '\u4eb2\uff0c\u8bf7\u767b\u5f55',
+                            '\u767b\u5f55\u540e\u67e5\u770b'
+                        ];
+                        if (strongMarkers.some((marker) => text.includes(marker))) return true;
+
+                        const inputs = Array.from(document.querySelectorAll('input')).filter(visible);
+                        const hasAccountInput = inputs.some((el) => {
+                            const attrs = [
+                                el.getAttribute('placeholder') || '',
+                                el.getAttribute('aria-label') || '',
+                                el.getAttribute('name') || ''
+                            ].join('');
+                            return /(\u624b\u673a|\u8d26\u53f7|\u5bc6\u7801|phone|mobile|login|password)/i.test(attrs);
+                        });
+                        if (!hasAccountInput) return false;
+
+                        const buttons = Array.from(document.querySelectorAll('button, [role="button"], a, div, span'))
+                            .filter(visible);
+                        return buttons.some((el) => {
+                            const label = (el.innerText || el.textContent || '').replace(/\s+/g, '');
+                            return label === '\u767b\u5f55' || label.includes('\u767b\u5f55\u5e76\u540c\u610f');
+                        });
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    async def fill_chat_message(self, page: Page, message: str) -> bool:
+        await self._scroll_chat_messages_to_bottom(page)
+        if await self._type_chat_message_with_keyboard(page, message):
+            return True
+
+        await self._wait_for_fishing_page_stable(page)
+        filled = await self._fishing_evaluate(
+            page,
+            r"""
+            (message) => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const dispatch = (el) => {
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    el.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true, key: 'a'}));
+                };
+                const candidates = Array.from(document.querySelectorAll([
+                    'textarea',
+                    'input[type="text"]',
+                    '[contenteditable="true"]',
+                    '[role="textbox"]'
+                ].join(','))).filter(visible);
+
+                const scored = candidates.map((el) => {
+                    const text = [
+                        el.getAttribute('placeholder') || '',
+                        el.getAttribute('aria-label') || '',
+                        el.innerText || '',
+                        el.textContent || ''
+                    ].join(' ');
+                    const rect = el.getBoundingClientRect();
+                    let score = rect.top;
+                    if (/请输入消息|消息|输入/.test(text)) score += 100000;
+                    if (rect.top > window.innerHeight * 0.55) score += 50000;
+                    return {el, score};
+                }).sort((a, b) => b.score - a.score);
+
+                const target = scored[0]?.el;
+                if (!target) return false;
+                target.scrollIntoView({block: 'center', inline: 'center'});
+                target.focus();
+                target.click();
+                if (target.isContentEditable || target.getAttribute('contenteditable') === 'true') {
+                    target.textContent = message;
+                } else {
+                    const setter = Object.getOwnPropertyDescriptor(target.__proto__, 'value')?.set;
+                    if (setter) {
+                        setter.call(target, message);
+                    } else {
+                        target.value = message;
+                    }
+                }
+                dispatch(target);
+                return true;
+            }
+            """,
+            message,
+        )
+        if filled:
+            await AntiDetect.random_delay(0.2, 0.5)
+            if await self._chat_input_has_text(page, message):
+                print(f"[{self.PLATFORM}] fishing input typed by dom set", flush=True)
+                return True
+            print(f"[{self.PLATFORM}] fishing dom set did not change textbox", flush=True)
+
+        selectors = [
+            "textarea",
+            "[contenteditable='true']",
+            "[role='textbox']",
+            "input[type='text']",
+            "[class*='input'] textarea",
+            "[class*='Input'] textarea",
+        ]
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).last
+                if await locator.count() == 0:
+                    continue
+                if not await locator.is_visible(timeout=2000):
+                    continue
+                await locator.click(timeout=3000)
+                try:
+                    await locator.fill(message, timeout=5000)
+                except Exception:
+                    await page.keyboard.press("Control+A")
+                    await page.keyboard.press("Backspace")
+                    await page.keyboard.type(message, delay=40)
+                await AntiDetect.random_delay(0.2, 0.5)
+                if await self._chat_input_has_text(page, message):
+                    print(f"[{self.PLATFORM}] fishing input typed by fallback selector", flush=True)
+                    return True
+            except Exception:
+                continue
+        await self._save_fishing_debug_snapshot(page, "chat_input_not_found")
+        await self._save_fishing_input_diagnostics(page)
+        return False
+
+    async def _type_chat_message_with_keyboard(self, page: Page, message: str) -> bool:
+        await self._wait_for_fishing_page_stable(page)
+        for context in [page, *page.frames]:
+            locator_builders = [
+                lambda ctx=context: ctx.get_by_placeholder("请输入消息", exact=False).last,
+                lambda ctx=context: ctx.locator("textarea[placeholder*='消息']").last,
+                lambda ctx=context: ctx.locator("input[placeholder*='消息']").last,
+                lambda ctx=context: ctx.locator("[contenteditable='true']").last,
+                lambda ctx=context: ctx.locator("[role='textbox']").last,
+                lambda ctx=context: ctx.locator("textarea").last,
+                lambda ctx=context: ctx.locator("input[type='text']").last,
+            ]
+            for build_locator in locator_builders:
+                try:
+                    locator = build_locator()
+                    if await locator.count() == 0:
+                        continue
+                    if not await locator.is_visible(timeout=1200):
+                        continue
+                    await locator.scroll_into_view_if_needed(timeout=2000)
+                    await locator.click(timeout=3000)
+                    await page.keyboard.press("Control+A")
+                    await page.keyboard.press("Backspace")
+                    await page.keyboard.insert_text(message)
+                    await AntiDetect.random_delay(0.2, 0.5)
+                    if await self._chat_input_has_text(page, message):
+                        print(f"[{self.PLATFORM}] fishing input typed by locator", flush=True)
+                        return True
+                    print(f"[{self.PLATFORM}] fishing locator focused but text not detected", flush=True)
+                except Exception:
+                    continue
+
+        clicked = await self._fishing_evaluate(
+            page,
+            r"""
+            () => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const candidates = Array.from(document.querySelectorAll([
+                    'textarea',
+                    'input[type="text"]',
+                    '[contenteditable="true"]',
+                    '[role="textbox"]'
+                ].join(','))).filter(visible);
+                const scored = candidates.map((el) => {
+                    const rect = el.getBoundingClientRect();
+                    const text = [
+                        el.getAttribute('placeholder') || '',
+                        el.getAttribute('aria-label') || ''
+                    ].join(' ');
+                    let score = rect.top;
+                    if (/请输入消息|消息|输入/.test(text)) score += 100000;
+                    if (rect.top > window.innerHeight * 0.55) score += 50000;
+                    return {el, score};
+                }).sort((a, b) => b.score - a.score);
+                const target = scored[0]?.el;
+                if (!target) return false;
+                target.scrollIntoView({block: 'center', inline: 'center'});
+                target.focus();
+                target.click();
+                return true;
+            }
+            """,
+        )
+        if not clicked:
+            return await self._type_chat_message_by_coordinates(page, message)
+        try:
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.insert_text(message)
+            await AntiDetect.random_delay(0.2, 0.5)
+            if await self._chat_input_has_text(page, message):
+                print(f"[{self.PLATFORM}] fishing input typed by dom focus", flush=True)
+                return True
+            return await self._type_chat_message_by_coordinates(page, message)
+        except Exception:
+            return False
+
+    async def _type_chat_message_by_coordinates(self, page: Page, message: str) -> bool:
+        try:
+            width, height = await self._page_inner_size(page)
+            points = [
+                (max(40, width * 0.06), max(120, height - 95)),
+                (max(140, width * 0.16), max(120, height - 95)),
+                (max(260, width * 0.28), max(120, height - 95)),
+                (max(40, width * 0.06), max(120, height - 55)),
+                (max(140, width * 0.16), max(120, height - 55)),
+            ]
+            for x, y in points:
+                await page.mouse.click(x, y)
+                await AntiDetect.random_delay(0.2, 0.4)
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Backspace")
+                await page.keyboard.insert_text(message)
+                await AntiDetect.random_delay(0.3, 0.6)
+                if await self._chat_input_has_text(page, message):
+                    print(f"[{self.PLATFORM}] fishing input typed by coordinates ({x:.0f},{y:.0f})", flush=True)
+                    return True
+            await self._save_fishing_debug_snapshot(page, "chat_input_text_not_detected")
+            await self._save_fishing_input_diagnostics(page)
+            print(f"[{self.PLATFORM}] fishing coordinate input did not change textbox", flush=True)
+            return False
+        except Exception:
+            return False
+
+    async def _page_inner_size(self, page: Page) -> tuple[int, int]:
+        try:
+            size = await self._fishing_evaluate(
+                page,
+                "() => ({width: window.innerWidth || 1366, height: window.innerHeight || 768})",
+            )
+            return (int(size.get("width") or 1366), int(size.get("height") or 768))
+        except Exception:
+            viewport = page.viewport_size or {"width": 1366, "height": 768}
+            return (int(viewport.get("width") or 1366), int(viewport.get("height") or 768))
+
+    async def _save_fishing_input_diagnostics(self, page: Page, reason: str = "input_diagnostics") -> None:
+        try:
+            diagnostics = []
+            script = r"""
+            () => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                return Array.from(document.querySelectorAll('*'))
+                    .filter(visible)
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+                        return {
+                            tag: el.tagName,
+                            role: el.getAttribute('role') || '',
+                            placeholder: el.getAttribute('placeholder') || '',
+                            aria: el.getAttribute('aria-label') || '',
+                            contenteditable: el.getAttribute('contenteditable') || '',
+                            className: String(el.className || '').slice(0, 160),
+                            id: el.id || '',
+                            text: text.slice(0, 120),
+                            rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height}
+                        };
+                    })
+                    .filter((item) =>
+                        /输入|消息|发送|textarea|input|textbox|editable/i.test(
+                            `${item.tag} ${item.role} ${item.placeholder} ${item.aria} ${item.contenteditable} ${item.className} ${item.text}`
+                        )
+                    )
+                    .slice(-80);
+            }
+            """
+            for index, frame in enumerate([page, *page.frames]):
+                try:
+                    diagnostics.append({"frame": index, "url": getattr(frame, "url", ""), "items": await frame.evaluate(script)})
+                except Exception as exc:
+                    diagnostics.append({"frame": index, "error": str(exc)})
+            output_dir = Path("data/debug")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = output_dir / f"{timestamp}_{self.PLATFORM}_fishing_{reason}.json"
+            path.write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[{self.PLATFORM}] fishing input diagnostics saved: {path}", flush=True)
+        except Exception as exc:
+            print(f"[{self.PLATFORM}] fishing input diagnostics failed: {exc}", flush=True)
+            try:
+                output_dir = Path("data/debug")
+                output_dir.mkdir(parents=True, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                path = output_dir / f"{timestamp}_{self.PLATFORM}_fishing_{reason}_failed.json"
+                path.write_text(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
+    async def _chat_input_has_text(self, page: Page, message: str) -> bool:
+        try:
+            script = r"""
+            () => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                return Array.from(document.querySelectorAll([
+                    'textarea',
+                    'input[type="text"]',
+                    '[contenteditable="true"]',
+                    '[role="textbox"]'
+                ].join(','))).filter(visible)
+                    .map((el) => el.value || el.innerText || el.textContent || '')
+                    .join('\n');
+            }
+            """
+            values = []
+            for context in [page, *page.frames]:
+                try:
+                    values.append(str(await context.evaluate(script) or ""))
+                except Exception:
+                    continue
+            combined = "\n".join(values)
+            return str(message).strip() in combined.strip()
+        except Exception:
+            return False
+
+    async def send_chat_message(self, page: Page, message: str) -> bool:
+        print(f"[{self.PLATFORM}] fishing input message: {message}", flush=True)
+        await self._save_fishing_input_diagnostics(page, reason="pre_input")
+        if not await self.fill_chat_message(page, message):
+            print(f"[{self.PLATFORM}] fishing input failed", flush=True)
+            return False
+
+        before_messages = await self.read_chat_messages(
+            page,
+            save_diagnostics=False,
+            scroll_to_top=False,
+            verbose=False,
+        )
+        before_count = self._count_message_occurrences(before_messages, message)
+        print(f"[{self.PLATFORM}] fishing clicking send", flush=True)
+        await AntiDetect.random_delay(0.4, 0.8)
+        send_labels = ["发送", "发 送"]
+        for context in [page, *page.frames]:
+            for label in send_labels:
+                try:
+                    locator = context.get_by_text(label, exact=True).last
+                    if await locator.count() > 0 and await locator.is_visible(timeout=1000):
+                        disabled = await locator.evaluate(
+                            "(el) => el.disabled || el.getAttribute('aria-disabled') === 'true' || /disabled/.test(el.className || '')"
+                        )
+                        if disabled:
+                            continue
+                        await locator.click(timeout=3000)
+                        await self._wait_for_fishing_page_stable(page, timeout=5000)
+                        print(f"[{self.PLATFORM}] fishing send clicked by text", flush=True)
+                        return await self._wait_for_sent_message(page, message, before_count)
+                except Exception:
+                    continue
+        clicked = await self._fishing_evaluate(
+            page,
+            r"""
+            () => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none' &&
+                        Number(style.opacity || 1) > 0;
+                };
+                const nodes = Array.from(document.querySelectorAll('button, [role="button"], div, span'))
+                    .filter(visible)
+                    .filter((el) => (el.innerText || el.textContent || '').replace(/\s+/g, '') === '发送')
+                    .filter((el) => {
+                        const className = el.className || '';
+                        return !el.disabled &&
+                            el.getAttribute('aria-disabled') !== 'true' &&
+                            !/disabled/.test(String(className));
+                    });
+                const bottomNodes = nodes
+                    .map((el) => ({el, rect: el.getBoundingClientRect()}))
+                    .sort((a, b) => (b.rect.top - a.rect.top) || (b.rect.left - a.rect.left));
+                const target = bottomNodes[0]?.el;
+                if (!target) return false;
+                target.click();
+                return true;
+            }
+            """
+        )
+        if clicked:
+            await self._wait_for_fishing_page_stable(page, timeout=5000)
+            print(f"[{self.PLATFORM}] fishing send clicked by dom", flush=True)
+            return await self._wait_for_sent_message(page, message, before_count)
+        if await self._click_send_by_coordinates(page):
+            print(f"[{self.PLATFORM}] fishing send clicked by coordinates", flush=True)
+            return await self._wait_for_sent_message(page, message, before_count)
+        try:
+            await page.keyboard.press("Enter")
+            await self._wait_for_fishing_page_stable(page, timeout=5000)
+            await AntiDetect.random_delay(0.5, 1.0)
+            print(f"[{self.PLATFORM}] fishing send triggered by enter", flush=True)
+            return await self._wait_for_sent_message(page, message, before_count)
+        except Exception:
+            await self._save_fishing_debug_snapshot(page, "chat_send_failed")
+            return False
+
+    async def _wait_for_sent_message(self, page: Page, message: str, before_count: int, timeout_seconds: int = 8) -> bool:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while True:
+            messages = await self.read_chat_messages(
+                page,
+                save_diagnostics=False,
+                scroll_to_top=False,
+                verbose=False,
+            )
+            current_count = self._count_message_occurrences(messages, message)
+            input_empty = not await self._chat_input_has_text(page, message)
+            if current_count > before_count or (current_count > 0 and input_empty):
+                print(f"[{self.PLATFORM}] fishing send confirmed", flush=True)
+                return True
+            if asyncio.get_running_loop().time() >= deadline:
+                print(f"[{self.PLATFORM}] fishing send not confirmed", flush=True)
+                await self._save_fishing_debug_snapshot(page, "chat_send_not_confirmed")
+                return False
+            await asyncio.sleep(1)
+
+    def _count_message_occurrences(self, messages: list[Dict[str, str]], message: str) -> int:
+        target = str(message or "").strip()
+        if not target:
+            return 0
+        return sum(
+            1
+            for item in messages
+            if item.get("sender") == "buyer" and target in str(item.get("content", ""))
+        )
+
+    async def _click_send_by_coordinates(self, page: Page) -> bool:
+        try:
+            viewport = page.viewport_size or {"width": 1366, "height": 768}
+            width = int(viewport.get("width") or 1366)
+            height = int(viewport.get("height") or 768)
+            await page.mouse.click(max(50, width - 70), max(80, height - 35))
+            await self._wait_for_fishing_page_stable(page, timeout=5000)
+            await AntiDetect.random_delay(0.5, 1.0)
+            return True
+        except Exception:
+            return False
+
+    async def _scroll_chat_messages_to_bottom(self, page: Page) -> None:
+        script = r"""
+            () => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const candidates = Array.from(document.querySelectorAll('div, section, main'))
+                    .filter(visible)
+                    .filter((el) => el.scrollHeight > el.clientHeight + 80)
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        const className = String(el.className || '');
+                        const hasMessage = Boolean(el.querySelector(
+                            '[class*="message-row"], [class*="MessageRow"], [class*="message-content"], [class*="bubble"]'
+                        ));
+                        let score = 0;
+                        if (hasMessage) score += 120;
+                        if (/message|msg|chat|im|conversation|list|body|content/i.test(className)) score += 80;
+                        if (rect.top < window.innerHeight - 180) score += 30;
+                        if (rect.width > window.innerWidth * 0.35) score += 20;
+                        return {el, score, scrollHeight: el.scrollHeight};
+                    })
+                    .filter((item) => item.score >= 80)
+                    .sort((a, b) => (b.score - a.score) || (b.scrollHeight - a.scrollHeight));
+                const target = candidates[0]?.el || document.scrollingElement || document.documentElement;
+                target.scrollTop = target.scrollHeight;
+                window.scrollTo(0, document.body.scrollHeight);
+                return {
+                    found: Boolean(candidates[0]),
+                    scrollTop: target.scrollTop,
+                    scrollHeight: target.scrollHeight,
+                    clientHeight: target.clientHeight
+                };
+            }
+        """
+        for context in [page, *page.frames]:
+            try:
+                await context.evaluate(script)
+            except Exception:
+                pass
+        try:
+            viewport = page.viewport_size or {"width": 1366, "height": 768}
+            await page.mouse.move(int(viewport["width"] * 0.5), int(viewport["height"] * 0.45))
+            await page.mouse.wheel(0, 1800)
+        except Exception:
+            pass
+        await AntiDetect.random_delay(0.3, 0.6)
+
+    async def _scroll_chat_messages_to_top(self, page: Page) -> None:
+        script = r"""
+            () => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const candidates = Array.from(document.querySelectorAll('div, section, main'))
+                    .filter(visible)
+                    .filter((el) => el.scrollHeight > el.clientHeight + 80)
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        const className = String(el.className || '');
+                        const hasMessage = Boolean(el.querySelector(
+                            '[class*="message-row"], [class*="MessageRow"], [class*="message-content"], [class*="bubble"]'
+                        ));
+                        let score = 0;
+                        if (hasMessage) score += 120;
+                        if (/message|msg|chat|im|conversation|list|body|content/i.test(className)) score += 80;
+                        if (rect.top < window.innerHeight - 180) score += 30;
+                        if (rect.width > window.innerWidth * 0.35) score += 20;
+                        return {el, score, scrollHeight: el.scrollHeight, top: rect.top};
+                    })
+                    .filter((item) => item.score >= 80)
+                    .sort((a, b) => (b.score - a.score) || (b.scrollHeight - a.scrollHeight));
+                const target = candidates[0]?.el || document.scrollingElement || document.documentElement;
+                target.scrollTop = 0;
+                window.scrollTo(0, 0);
+                return {
+                    found: Boolean(candidates[0]),
+                    className: String(target.className || '').slice(0, 120),
+                    scrollTop: target.scrollTop,
+                    scrollHeight: target.scrollHeight,
+                    clientHeight: target.clientHeight
+                };
+            }
+        """
+        for context in [page, *page.frames]:
+            try:
+                await context.evaluate(script)
+            except Exception:
+                pass
+        try:
+            viewport = page.viewport_size or {"width": 1366, "height": 768}
+            await page.mouse.move(int(viewport["width"] * 0.5), int(viewport["height"] * 0.45))
+            for _ in range(5):
+                await page.mouse.wheel(0, -1800)
+                await AntiDetect.random_delay(0.15, 0.25)
+        except Exception:
+            pass
+        await AntiDetect.random_delay(0.5, 0.8)
+
+    async def read_chat_messages(
+        self,
+        page: Page,
+        save_diagnostics: bool = False,
+        scroll_to_top: bool = True,
+        verbose: bool = True,
+    ) -> list[Dict[str, str]]:
+        await self._wait_for_fishing_page_stable(page)
+        if scroll_to_top and verbose:
+            print(f"[{self.PLATFORM}] fishing scrolling chat to top before reading", flush=True)
+        if scroll_to_top:
+            await self._scroll_chat_messages_to_top(page)
+        script = r"""
+            () => {
+                const clean = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const rejectText = /立即购买|闲鱼号|请输入消息|发送|活动价|含运费|商品详情|北京|表情|图片|剪刀|地址|手机壳/;
+                const inputAreaTop = Math.max(0, window.innerHeight - 170);
+                const candidates = Array.from(document.querySelectorAll('div, span, p, pre'))
+                    .filter(visible)
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        const text = clean(el.innerText || el.textContent);
+                        const className = String(el.className || '');
+                        let score = 0;
+                        if (/message|msg|bubble|chat|talk|im|content/i.test(className)) score += 80;
+                        if (rect.top > 180 && rect.top < inputAreaTop) score += 60;
+                        if (rect.width >= 20 && rect.width <= window.innerWidth * 0.75) score += 30;
+                        if (text.length >= 1 && text.length <= 220) score += 30;
+                        return {rect, text, className, score};
+                    })
+                    .filter((item) => item.text && item.score >= 80)
+                    .filter((item) => item.rect.top > 160 && item.rect.top < inputAreaTop)
+                    .filter((item) => !rejectText.test(item.text))
+                    .filter((item) => !/^\d+(\.\d+)?$/.test(item.text));
+
+                const seen = new Set();
+                return candidates
+                    .sort((a, b) => (a.rect.top - b.rect.top) || (a.rect.left - b.rect.left) || (b.score - a.score))
+                    .filter((item) => {
+                        const key = `${item.text}|${Math.round(item.rect.top / 6)}`;
+                        if (seen.has(key)) return false;
+                        seen.add(key);
+                        return true;
+                    })
+                    .slice(-20)
+                    .map((item) => ({
+                        sender: item.rect.left > window.innerWidth * 0.45 ? 'buyer' : 'seller',
+                        content: item.text,
+                        score: item.score,
+                        rect: {
+                            x: item.rect.x,
+                            y: item.rect.y,
+                            width: item.rect.width,
+                            height: item.rect.height
+                        },
+                        className: item.className.slice(0, 120),
+                    }));
+            }
+        """
+        all_messages = []
+        diagnostics = []
+        for index, context in enumerate([page, *page.frames]):
+            try:
+                messages = await context.evaluate(script)
+                for message in messages or []:
+                    item = dict(message)
+                    item["frame"] = index
+                    all_messages.append(item)
+                diagnostics.append({"frame": index, "url": getattr(context, "url", ""), "messages": messages or []})
+            except Exception as exc:
+                diagnostics.append({"frame": index, "error": str(exc)})
+
+        if save_diagnostics:
+            await self._save_fishing_message_diagnostics(diagnostics)
+
+        seen = set()
+        result = []
+        for message in sorted(all_messages, key=lambda item: (item.get("frame", 0), item.get("rect", {}).get("y", 0))):
+            content = str(message.get("content", "")).strip()
+            if not content or content in seen:
+                continue
+            seen.add(content)
+            result.append({"sender": message.get("sender", ""), "content": content})
+        return result[-20:]
+
+    async def read_chat_messages(
+        self,
+        page: Page,
+        save_diagnostics: bool = False,
+        scroll_to_top: bool = True,
+        verbose: bool = True,
+    ) -> list[Dict[str, str]]:
+        await self._wait_for_fishing_page_stable(page)
+        if scroll_to_top and verbose:
+            print(f"[{self.PLATFORM}] fishing scrolling chat to top before reading", flush=True)
+        if scroll_to_top:
+            await self._scroll_chat_messages_to_top(page)
+        script = r"""
+            () => {
+                const clean = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const inputAreaTop = Math.max(0, window.innerHeight - 170);
+                const centerX = window.innerWidth / 2;
+                const rejectWords = [
+                    '\u7acb\u5373\u8d2d\u4e70', '\u95f2\u9c7c\u53f7',
+                    '\u8bf7\u8f93\u5165\u6d88\u606f', '\u6309Enter\u952e\u53d1\u9001',
+                    '\u70b9\u51fb\u53d1\u9001\u6309\u94ae\u53d1\u9001',
+                    '\u6d3b\u52a8\u4ef7', '\u542b\u8fd0\u8d39', '\u5546\u54c1\u8be6\u60c5',
+                    '\u5317\u4eac', '\u8868\u60c5', '\u56fe\u7247', '\u526a\u5200',
+                    '\u5730\u5740', '\u53d1\u95f2\u7f6e', '\u53cd\u9988',
+                    '\u5ba2\u670d', '\u56de\u9876\u90e8', 'APP',
+                    '\u53d1\u9001', '\u53d1 \u9001', '\u5df2\u8bfb'
+                ];
+                const isNoise = (text) => {
+                    if (!text || rejectWords.some((word) => text.includes(word))) return true;
+                    if (/^\d+(\.\d+)?$/.test(text)) return true;
+                    if (/^\d{1,2}:\d{2}$/.test(text)) return true;
+                    if (/^[A-Za-z0-9_*.\-\s]{1,20}$/.test(text)) return true;
+                    return false;
+                };
+                const makeItem = (el, row) => {
+                    const rect = el.getBoundingClientRect();
+                    const text = clean(el.innerText || el.textContent);
+                    const className = String(el.className || row?.className || '');
+                    return {
+                        sender: (rect.left + rect.width / 2) > centerX ? 'buyer' : 'seller',
+                        content: text,
+                        score: 300,
+                        rect: {
+                            x: rect.x,
+                            y: rect.y,
+                            width: rect.width,
+                            height: rect.height
+                        },
+                        className: className.slice(0, 120),
+                    };
+                };
+                const validItem = (item) =>
+                    item.content &&
+                    item.rect.y > 40 &&
+                    item.rect.y < inputAreaTop &&
+                    item.rect.width >= 18 &&
+                    item.rect.width <= window.innerWidth * 0.65 &&
+                    item.content.length <= 260 &&
+                    !isNoise(item.content);
+
+                const messageRows = Array.from(document.querySelectorAll(
+                    '[class*="message-row"], [class*="MessageRow"], [class*="msg-row"], [class*="bubble"]'
+                )).filter(visible);
+                const rowItems = messageRows.flatMap((row) => {
+                    const bubbles = Array.from(row.querySelectorAll(
+                        '[class*="message-content"], [class*="MessageContent"], [class*="bubble"]'
+                    )).filter(visible);
+                    const items = bubbles.length ? bubbles.map((bubble) => makeItem(bubble, row)) : [makeItem(row, row)];
+                    return items.filter(validItem);
+                });
+
+                const globalItems = Array.from(document.querySelectorAll(
+                    '[class*="message-content"], [class*="MessageContent"], [class*="bubble"]'
+                )).filter(visible).map((el) => makeItem(el, null)).filter(validItem);
+                const rightTextItems = Array.from(document.querySelectorAll('div, span, p, pre'))
+                    .filter(visible)
+                    .map((el) => makeItem(el, null))
+                    .filter(validItem)
+                    .filter((item) => (item.rect.x + item.rect.width / 2) > centerX)
+                    .filter((item) => item.rect.width <= window.innerWidth * 0.35);
+                const candidates = [...rowItems, ...globalItems, ...rightTextItems];
+
+                const seen = new Set();
+                return candidates
+                    .sort((a, b) => (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x) || (b.score - a.score))
+                    .filter((item) => {
+                        const key = `${item.content}|${Math.round(item.rect.y / 6)}`;
+                        if (seen.has(key)) return false;
+                        seen.add(key);
+                        return true;
+                    })
+                    .slice(-20);
+            }
+        """
+        all_messages = []
+        diagnostics = []
+        scan_rounds = 8 if scroll_to_top else 1
+        for scan_index in range(scan_rounds):
+            for index, context in enumerate([page, *page.frames]):
+                try:
+                    messages = await context.evaluate(script)
+                    for message in messages or []:
+                        item = dict(message)
+                        item["frame"] = index
+                        item["scan"] = scan_index
+                        all_messages.append(item)
+                    diagnostics.append({
+                        "scan": scan_index,
+                        "frame": index,
+                        "url": getattr(context, "url", ""),
+                        "messages": messages or [],
+                    })
+                except Exception as exc:
+                    diagnostics.append({"scan": scan_index, "frame": index, "error": str(exc)})
+            if scroll_to_top and scan_index < scan_rounds - 1:
+                scroll_script = r"""
+                    () => {
+                        const visible = (el) => {
+                            const rect = el.getBoundingClientRect();
+                            const style = window.getComputedStyle(el);
+                            return rect.width > 0 && rect.height > 0 &&
+                                style.visibility !== 'hidden' && style.display !== 'none';
+                        };
+                        const candidates = Array.from(document.querySelectorAll('div, section, main'))
+                            .filter(visible)
+                            .filter((el) => el.scrollHeight > el.clientHeight + 80)
+                            .map((el) => {
+                                const rect = el.getBoundingClientRect();
+                                const className = String(el.className || '');
+                                const hasMessage = Boolean(el.querySelector(
+                                    '[class*="message-row"], [class*="MessageRow"], [class*="message-content"], [class*="bubble"]'
+                                ));
+                                let score = 0;
+                                if (hasMessage) score += 120;
+                                if (/message|msg|chat|im|conversation|list|body|content/i.test(className)) score += 80;
+                                if (rect.top < window.innerHeight - 180) score += 30;
+                                if (rect.width > window.innerWidth * 0.35) score += 20;
+                                return {el, score, scrollHeight: el.scrollHeight};
+                            })
+                            .filter((item) => item.score >= 80)
+                            .sort((a, b) => (b.score - a.score) || (b.scrollHeight - a.scrollHeight));
+                        const target = candidates[0]?.el || document.scrollingElement || document.documentElement;
+                        const before = target.scrollTop;
+                        target.scrollTop = Math.min(
+                            target.scrollTop + Math.max(240, Math.floor(target.clientHeight * 0.75)),
+                            target.scrollHeight
+                        );
+                        return {before, after: target.scrollTop, scrollHeight: target.scrollHeight};
+                    }
+                """
+                for context in [page, *page.frames]:
+                    try:
+                        await context.evaluate(scroll_script)
+                    except Exception:
+                        pass
+                try:
+                    viewport = page.viewport_size or {"width": 1366, "height": 768}
+                    await page.mouse.move(int(viewport["width"] * 0.5), int(viewport["height"] * 0.45))
+                    await page.mouse.wheel(0, 650)
+                    await AntiDetect.random_delay(0.2, 0.35)
+                except Exception:
+                    pass
+
+        if save_diagnostics:
+            await self._save_fishing_message_diagnostics(diagnostics)
+
+        seen = set()
+        result = []
+        for message in sorted(
+            all_messages,
+            key=lambda item: (item.get("scan", 0), item.get("frame", 0), item.get("rect", {}).get("y", 0)),
+        ):
+            content = str(message.get("content", "")).strip()
+            if not content:
+                continue
+            key = (message.get("sender", ""), content)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append({"sender": message.get("sender", ""), "content": content})
+        result = result[-80:]
+        if verbose:
+            print(f"[{self.PLATFORM}] fishing recognized chat messages: {len(result)}", flush=True)
+            for index, message in enumerate(result, 1):
+                print(
+                    f"[{self.PLATFORM}] fishing chat message {index}: "
+                    f"{message.get('sender', '')}: {message.get('content', '')}",
+                    flush=True,
+                )
+        return result
+
+    async def wait_for_seller_messages(
+        self,
+        page: Page,
+        known_contents: set[str],
+        timeout_seconds: int = 45,
+    ) -> list[Dict[str, str]]:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while True:
+            messages = await self.read_chat_messages(
+                page,
+                save_diagnostics=False,
+                scroll_to_top=False,
+                verbose=False,
+            )
+            new_seller_messages = [
+                message for message in messages
+                if message.get("sender") == "seller" and message.get("content") not in known_contents
+            ]
+            if new_seller_messages:
+                return new_seller_messages
+            if asyncio.get_running_loop().time() >= deadline:
+                return []
+            await asyncio.sleep(3)
+
+    async def _save_fishing_message_diagnostics(self, diagnostics: list[dict]) -> None:
+        try:
+            output_dir = Path("data/debug")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = output_dir / f"{timestamp}_{self.PLATFORM}_fishing_messages_poll.json"
+            path.write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    async def close_fishing_browser(self) -> None:
+        if self.browser:
+            await self.browser.stop()
+            self.browser = None
+
+    async def _wait_for_fishing_page_stable(self, page: Page, timeout: int = 8000) -> None:
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=min(timeout, 3000))
+        except Exception:
+            pass
+
+    async def _fishing_evaluate(self, page: Page, script: str, arg: Any = None, retries: int = 3) -> Any:
+        last_exc = None
+        for attempt in range(retries):
+            try:
+                await self._wait_for_fishing_page_stable(page, timeout=5000)
+                if arg is None:
+                    return await page.evaluate(script)
+                return await page.evaluate(script, arg)
+            except PlaywrightError as exc:
+                last_exc = exc
+                text = str(exc)
+                navigation_related = (
+                    "Execution context was destroyed" in text
+                    or "most likely because of a navigation" in text
+                    or "Cannot find context with specified id" in text
+                )
+                if not navigation_related or attempt == retries - 1:
+                    raise
+                await asyncio.sleep(0.8 + attempt * 0.5)
+        raise last_exc
+
+    async def _click_chat_button(self, page: Page) -> bool:
+        labels = ["聊一聊", "我想要", "联系卖家", "立即沟通", "去聊天"]
+        for label in labels:
+            selectors = [
+                f"button:has-text('{label}')",
+                f"[role='button']:has-text('{label}')",
+                f"a:has-text('{label}')",
+            ]
+            for selector in selectors:
+                try:
+                    locator = page.locator(selector).last
+                    if await locator.count() == 0:
+                        continue
+                    if not await locator.is_visible(timeout=2000):
+                        continue
+                    await locator.scroll_into_view_if_needed(timeout=3000)
+                    await locator.click(timeout=5000)
+                    return True
+                except Exception:
+                    continue
+
+        clicked = await self._fishing_evaluate(
+            page,
+            r"""
+            (labels) => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, div, span'))
+                    .filter(visible)
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        const text = (el.innerText || el.textContent || '').replace(/\s+/g, '');
+                        const style = window.getComputedStyle(el);
+                        let score = 0;
+                        if (labels.some((label) => text === label)) score += 1000;
+                        if (labels.some((label) => text.includes(label))) score += 300;
+                        if (el.matches('button, [role="button"], a')) score += 200;
+                        if (rect.width >= 50 && rect.width <= 260 && rect.height >= 28 && rect.height <= 90) score += 120;
+                        if (rect.top > window.innerHeight * 0.45) score += 80;
+                        if (rect.left > window.innerWidth * 0.45) score += 40;
+                        if (/rgb\(\s*255\s*,/.test(style.backgroundColor || '')) score += 30;
+                        score -= Math.max(0, text.length - 8) * 20;
+                        return {el, rect, text, score};
+                    });
+                const candidates = nodes.filter(({text, rect}) => {
+                    if (!text) return false;
+                    if (text.includes('消息') && !labels.some((label) => text.includes(label))) return false;
+                    if (text.length > 24) return false;
+                    if (rect.left > window.innerWidth - 120 && text === '消息') return false;
+                    return labels.some((label) => text.includes(label));
+                });
+                candidates.sort((a, b) => b.score - a.score);
+                const target = candidates[0]?.el;
+                if (!target) return false;
+                target.scrollIntoView({block: 'center', inline: 'center'});
+                target.click();
+                return true;
+            }
+            """,
+            labels,
+        )
+        return bool(clicked)
+
+    async def _resolve_chat_page(self, page: Page) -> Page:
+        deadline = asyncio.get_running_loop().time() + 12
+        while asyncio.get_running_loop().time() < deadline:
+            pages = list(page.context.pages)
+            for candidate in reversed(pages):
+                try:
+                    if await self._has_chat_input(candidate):
+                        return candidate
+                except Exception:
+                    continue
+            await asyncio.sleep(0.5)
+        return page
+
+    async def _has_chat_input(self, page: Page) -> bool:
+        script = r"""
+        () => {
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            return Array.from(document.querySelectorAll([
+                'textarea',
+                'input[type="text"]',
+                '[contenteditable="true"]',
+                '[role="textbox"]'
+            ].join(','))).some((el) => {
+                if (!visible(el)) return false;
+                const text = [
+                    el.getAttribute('placeholder') || '',
+                    el.getAttribute('aria-label') || '',
+                    el.innerText || '',
+                    el.textContent || ''
+                ].join(' ');
+                const rect = el.getBoundingClientRect();
+                return /请输入消息|消息|输入/.test(text) || rect.top > window.innerHeight * 0.55;
+            });
+        }
+        """
+        for context in [page, *page.frames]:
+            try:
+                if await context.evaluate(script):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _save_fishing_debug_snapshot(self, page: Page, reason: str) -> Path:
+        output_dir = Path("data/debug")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = output_dir / f"{timestamp}_{self.PLATFORM}_fishing_{reason}"
+        await page.screenshot(path=str(base.with_suffix(".png")), full_page=True)
+        base.with_suffix(".html").write_text(await page.content(), encoding="utf-8")
+        return base.with_suffix(".png")
 
     async def _click_xianyu_option(self, page: Page, candidate: Dict[str, Any]) -> bool:
         token = str(candidate.get("token", "")).strip()
@@ -824,7 +2049,7 @@ class XianyuAgent(BaseAgent):
 
         if not offers:
             return None
-        return min(offers, key=lambda offer: offer["price"])
+        return offers[0]
 
     async def _collect_xianyu_order_options(self, page: Page, intent: Dict[str, str]) -> Dict[str, Any]:
         return await page.evaluate(
@@ -845,14 +2070,19 @@ class XianyuAgent(BaseAgent):
                     return Number.isFinite(price) ? price : null;
                 };
                 const dayPattern = (days) => new RegExp(`${days}(?:\u5929|\u65e5|day|days)`, 'i');
+                const monthPattern = /(?:^|[^\u9001\u8d60])(?:\d+\u4e2a\u6708|[一二三四五六七八九十]+\u4e2a\u6708|\d+\u6708\u4f1a\u5458|[一二三四五六七八九十]+\u6708\u4f1a\u5458)/i;
+                const quarterPattern = /(?:\u5b63\u5361|\u5b63\u4f1a\u5458|\u4e09\u4e2a\u6708|\u4e09\u6708\u4f1a\u5458|3\u4e2a\u6708|3\u6708\u4f1a\u5458)/i;
                 const yearPattern = /(?:\u5e74\u5361|\u5e74\u4f1a\u5458|\u4e00\u5e74\u5361|\u4e24\u5e74\u5361|1\u5e74\u5361|2\u5e74\u5361|\u4e00\u5e74|\u4e24\u5e74|1\u5e74|2\u5e74|12\u4e2a\u6708|365\u5929)/i;
                 const hasSpecToken = (value) => dayPattern(7).test(value) ||
-                    dayPattern(15).test(value) || dayPattern(21).test(value) || yearPattern.test(value);
+                    dayPattern(15).test(value) || dayPattern(21).test(value) ||
+                    monthPattern.test(value) || quarterPattern.test(value) || yearPattern.test(value);
                 const specKinds = (value) => {
                     const kinds = [];
                     if (dayPattern(7).test(value)) kinds.push('7d');
                     if (dayPattern(15).test(value)) kinds.push('15d');
                     if (dayPattern(21).test(value)) kinds.push('21d');
+                    if (monthPattern.test(value)) kinds.push('month');
+                    if (quarterPattern.test(value)) kinds.push('quarter');
                     if (yearPattern.test(value)) kinds.push('year');
                     return kinds;
                 };
@@ -910,6 +2140,9 @@ class XianyuAgent(BaseAgent):
                     score -= Math.max(0, value.length - 24) / 4;
                     return score;
                 };
+                const directSpecChildCount = (el) => Array.from(el.children || [])
+                    .filter((child) => visible(child) && hasSpecToken(norm(child.innerText || child.textContent || '')))
+                    .length;
 
                 const selector = [
                     'button',
@@ -954,7 +2187,7 @@ class XianyuAgent(BaseAgent):
                     const optionTextHasSpec = hasSpecToken(key);
                     const optionTextMatchesIntent = specMatches(key);
                     const optionSpecKinds = specKinds(key);
-                    const optionLooksLikeContainer = optionSpecKinds.length > 1;
+                    const optionLooksLikeContainer = optionSpecKinds.length > 1 || directSpecChildCount(clickEl) >= 2;
                     const optionSoldOut = isSoldOut(clickEl, text || rawText);
 
                     if (optionLooksClickable && optionTextHasSpec && !optionLooksLikeContainer && !optionSeen.has(key)) {

@@ -8,9 +8,9 @@ import yaml
 
 class LLMConfig(BaseModel):
     provider: str = "openai_compatible"
-    model: str = "deepseek-chat"
+    model: str = "deepseek-v4-flash"
     api_key: str = ""
-    api_base: str = "https://api.deepseek.com/v1"
+    api_base: str = "https://api.vectorengine.ai/v1"
     temperature: float = 0.7
 
 

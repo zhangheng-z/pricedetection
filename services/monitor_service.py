@@ -93,6 +93,13 @@ class RunSummary:
         return sum(result.alerts for result in self.run_results)
 
 
+@dataclass
+class ReviewAlertsResult:
+    total_review_items: int
+    updated_items: int
+    review_results_file: str = ""
+
+
 class _StdoutTee(io.TextIOBase):
     def __init__(self, original, callback: Optional[Callable[[str], None]] = None):
         self.original = original
@@ -100,7 +107,8 @@ class _StdoutTee(io.TextIOBase):
         self._buffer = ""
 
     def write(self, text: str) -> int:
-        self.original.write(text)
+        if self.original is not None:
+            self.original.write(text)
         if self.callback:
             self._buffer += text
             while "\n" in self._buffer:
@@ -110,7 +118,8 @@ class _StdoutTee(io.TextIOBase):
         return len(text)
 
     def flush(self) -> None:
-        self.original.flush()
+        if self.original is not None:
+            self.original.flush()
         if self.callback and self._buffer:
             self.callback(self._buffer)
             self._buffer = ""
@@ -158,6 +167,102 @@ class MonitorService:
         path.write_text(content, encoding="utf-8")
         self.load_runtime_config()
 
+    def save_llm_config(self, llm_config: dict) -> None:
+        path = self.config_loader.config_dir / "settings.yaml"
+        raw_settings = ""
+        if path.exists():
+            raw_settings = path.read_text(encoding="utf-8")
+
+        llm_block = yaml.safe_dump(
+            {
+                "llm": {
+                    "provider": llm_config["provider"],
+                    "model": llm_config["model"],
+                    "api_key": llm_config["api_key"],
+                    "api_base": llm_config["api_base"],
+                    "temperature": float(llm_config["temperature"]),
+                }
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        )
+        updated_settings = self._replace_top_level_yaml_block(raw_settings, "llm", llm_block)
+        yaml.safe_load(updated_settings or "")
+        path.write_text(updated_settings, encoding="utf-8")
+        self.load_runtime_config()
+
+    def review_database_alerts(self, db_path: str) -> ReviewAlertsResult:
+        tee = _StdoutTee(sys.stdout, self.log_callback)
+        with redirect_stdout(tee):
+            try:
+                result = self._review_database_alerts_internal(db_path)
+                tee.flush()
+                return result
+            finally:
+                tee.flush()
+
+    def _review_database_alerts_internal(self, db_path: str) -> ReviewAlertsResult:
+        settings: Settings = self.config_loader.load_settings()
+        if not settings.llm.api_key:
+            raise ValueError("LLM API key not configured.")
+
+        db = Database(db_path)
+        alerts = db.list_review_alerts()
+        if not alerts:
+            print("No REVIEW alerts found.", flush=True)
+            return ReviewAlertsResult(total_review_items=0, updated_items=0)
+
+        run_results = self._review_alerts_to_run_results(alerts)
+        llm = LLMClient(settings.llm)
+        review_results_file, review_payload = self._save_review_results(run_results, llm)
+        self._apply_review_results(run_results, review_payload, db)
+        updated_items = self._count_review_decisions(review_payload)
+        if review_results_file:
+            print(f"Review results file: {review_results_file}", flush=True)
+        print(
+            f"Review alerts finished: total={len(alerts)}, updated={updated_items}",
+            flush=True,
+        )
+        return ReviewAlertsResult(
+            total_review_items=len(alerts),
+            updated_items=updated_items,
+            review_results_file=review_results_file,
+        )
+
+    def _review_alerts_to_run_results(self, alerts: List[dict]) -> List[ProductRunResult]:
+        results_by_key: Dict[tuple[str, str], ProductRunResult] = {}
+        for alert in alerts:
+            platform = str(alert.get("platform") or "")
+            product = str(alert.get("product_name") or "")
+            key = (platform, product)
+            result = results_by_key.get(key)
+            if result is None:
+                result = ProductRunResult(
+                    platform=platform,
+                    product=product,
+                    listings=0,
+                    alerts=0,
+                    account="database",
+                )
+                results_by_key[key] = result
+            result.items.append({
+                "title": alert.get("title", ""),
+                "price": alert.get("price", 0),
+                "url": alert.get("url", ""),
+                "judgment": alert.get("judgment", ""),
+                "spec_capture_mode": alert.get("spec_capture_mode", ""),
+                "spec_capture_info": alert.get("spec_capture_info", ""),
+            })
+            result.listings += 1
+            result.alerts += 1
+        return list(results_by_key.values())
+
+    def _count_review_decisions(self, review_payload: Dict[str, Any]) -> int:
+        count = 0
+        for batch in review_payload.get("batches", []):
+            count += sum(1 for result in batch.get("results", []) if isinstance(result, dict))
+        return count
+
     def list_accounts(self) -> List[dict]:
         config = self.load_runtime_config()
         accounts: List[AccountConfig] = config["accounts"]
@@ -194,17 +299,11 @@ class MonitorService:
 
         user_data_dir = Path(account.user_data_dir or f"data/browser_profiles/{account.id}")
         storage_state = Path(account.storage_state or f"data/auth/{account.id}.json")
-        login_session_dir = self.config_loader.project_dir / "data" / "login_sessions"
+        runtime_dir = self._runtime_dir()
+        login_session_dir = runtime_dir / "data" / "login_sessions"
         user_data_dir.mkdir(parents=True, exist_ok=True)
         storage_state.parent.mkdir(parents=True, exist_ok=True)
         login_session_dir.mkdir(parents=True, exist_ok=True)
-
-        python_path = self.config_loader.project_dir / "venv" / "Scripts" / "python.exe"
-        script_path = self.config_loader.project_dir / "scripts" / "save_login_state.py"
-        if not python_path.exists():
-            raise FileNotFoundError(f"Python interpreter not found: {python_path}")
-        if not script_path.exists():
-            raise FileNotFoundError(f"Login script not found: {script_path}")
 
         session_id = uuid.uuid4().hex
         wait_file = login_session_dir / f"{account.id}_{session_id}.signal"
@@ -215,8 +314,7 @@ class MonitorService:
             result_file.unlink()
 
         command = [
-            str(python_path),
-            str(script_path),
+            *self._login_helper_command(),
             "--platform",
             account.platform,
             "--account",
@@ -228,7 +326,7 @@ class MonitorService:
         ]
         process = subprocess.Popen(
             command,
-            cwd=str(self.config_loader.project_dir),
+            cwd=str(runtime_dir),
         )
 
         self._login_session = LoginSession(
@@ -372,7 +470,7 @@ class MonitorService:
                 review_results_file, review_payload = self._save_review_results(run_results, llm)
                 if review_results_file:
                     print(f"Review results file: {review_results_file}")
-                self._apply_review_results(run_results, review_payload)
+                self._apply_review_results(run_results, review_payload, db)
             deduped_results_file = self._save_deduped_run_results(run_results)
             if deduped_results_file:
                 print(f"Deduped run results file: {deduped_results_file}")
@@ -592,7 +690,12 @@ class MonitorService:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return (str(path), payload)
 
-    def _apply_review_results(self, run_results: List[ProductRunResult], review_payload: Dict[str, Any]) -> None:
+    def _apply_review_results(
+        self,
+        run_results: List[ProductRunResult],
+        review_payload: Dict[str, Any],
+        db: Database,
+    ) -> None:
         if not review_payload:
             return
 
@@ -629,10 +732,20 @@ class MonitorService:
                 if not decision:
                     continue
 
-                item["judgment"] = str(decision.get("decision", item.get("judgment", ""))).upper()
+                final_decision = str(decision.get("decision", item.get("judgment", ""))).upper()
+                review_reason = str(decision.get("reason", ""))
+                item["judgment"] = final_decision
                 item["review_sku"] = decision.get("sku", "")
-                item["review_reason"] = decision.get("reason", "")
+                item["review_reason"] = review_reason
                 item["review_confidence"] = decision.get("confidence", "")
+
+                if not url:
+                    continue
+                if final_decision == "NORMAL":
+                    db.delete_alert_by_url(url)
+                    continue
+                if final_decision in {"VIOLATION", "SUSPECTED", "DELIST", "REVIEW"}:
+                    db.update_alert_judgment_by_url(url, final_decision, review_reason)
 
     def _result_to_dict(self, result: ProductRunResult) -> dict:
         return {
@@ -655,6 +768,46 @@ class MonitorService:
 
     def _has_usable_storage_state(self, path: Path) -> bool:
         return path.exists() and path.stat().st_size > 0
+
+    def _replace_top_level_yaml_block(self, content: str, key: str, replacement: str) -> str:
+        lines = content.splitlines()
+        start = None
+        for index, line in enumerate(lines):
+            if line == f"{key}:":
+                start = index
+                break
+
+        if start is None:
+            prefix = content.rstrip()
+            return f"{replacement}\n" if not prefix else f"{replacement}\n{prefix}\n"
+
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            line = lines[index]
+            if line and not line.startswith((" ", "\t", "#")):
+                end = index
+                break
+
+        replacement_lines = replacement.rstrip().splitlines()
+        updated_lines = lines[:start] + replacement_lines + lines[end:]
+        return "\n".join(updated_lines).rstrip() + "\n"
+
+    def _runtime_dir(self) -> Path:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent
+        return self.config_loader.project_dir
+
+    def _login_helper_command(self) -> List[str]:
+        if getattr(sys, "frozen", False):
+            return [sys.executable, "--login-helper"]
+
+        python_path = self.config_loader.project_dir / "venv" / "Scripts" / "python.exe"
+        script_path = self.config_loader.project_dir / "scripts" / "save_login_state.py"
+        if not python_path.exists():
+            raise FileNotFoundError(f"Python interpreter not found: {python_path}")
+        if not script_path.exists():
+            raise FileNotFoundError(f"Login script not found: {script_path}")
+        return [str(python_path), str(script_path)]
 
     def _cleanup_login_session_files(self, session: LoginSession) -> None:
         for file_path in (session.wait_file, session.result_file):
