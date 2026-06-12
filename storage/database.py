@@ -63,6 +63,8 @@ class Database:
                     judgment TEXT NOT NULL,
                     reason TEXT DEFAULT '',
                     status TEXT DEFAULT 'pending',
+                    product_type TEXT DEFAULT '',
+                    payment_status TEXT DEFAULT '',
                     spec_capture_mode TEXT DEFAULT '',
                     spec_capture_info TEXT DEFAULT '',
                     created_at TEXT DEFAULT (datetime('now', 'localtime')),
@@ -134,6 +136,8 @@ class Database:
             self._ensure_column(conn, "listings", "spec_capture_info", "TEXT DEFAULT ''")
             self._ensure_column(conn, "price_alerts", "spec_capture_mode", "TEXT DEFAULT ''")
             self._ensure_column(conn, "price_alerts", "spec_capture_info", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "price_alerts", "product_type", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "price_alerts", "payment_status", "TEXT DEFAULT ''")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_fishing_messages_listing ON fishing_messages(listing_id)"
             )
@@ -286,6 +290,8 @@ class Database:
                     a.judgment,
                     a.reason,
                     a.status,
+                    a.product_type,
+                    a.payment_status,
                     COALESCE(NULLIF(a.spec_capture_mode, ''), l.spec_capture_mode, '') AS spec_capture_mode,
                     COALESCE(NULLIF(a.spec_capture_info, ''), l.spec_capture_info, '') AS spec_capture_info,
                     a.created_at,
@@ -343,6 +349,8 @@ class Database:
                     a.judgment,
                     a.reason,
                     a.status,
+                    a.product_type,
+                    a.payment_status,
                     COALESCE(NULLIF(a.spec_capture_mode, ''), l.spec_capture_mode, '') AS spec_capture_mode,
                     COALESCE(NULLIF(a.spec_capture_info, ''), l.spec_capture_info, '') AS spec_capture_info,
                     a.created_at,
@@ -434,6 +442,8 @@ class Database:
                     a.judgment,
                     a.reason,
                     a.status,
+                    a.product_type,
+                    a.payment_status,
                     COALESCE(NULLIF(a.spec_capture_mode, ''), l.spec_capture_mode, '') AS spec_capture_mode,
                     COALESCE(NULLIF(a.spec_capture_info, ''), l.spec_capture_info, '') AS spec_capture_info,
                     l.seller_name,
@@ -543,8 +553,99 @@ class Database:
     def update_alert_status(self, alert_id: int, status: str) -> bool:
         with self._get_conn() as conn:
             cur = conn.execute(
-                "UPDATE price_alerts SET status = ? WHERE id = ?",
-                (status, alert_id),
+                """
+                UPDATE price_alerts
+                SET status = ?,
+                    payment_status = CASE
+                        WHEN product_type = 'channel_resale' AND ? = 'resolved' THEN 'paid'
+                        WHEN product_type = 'channel_resale' AND ? = 'manual_required' THEN 'unpaid'
+                        ELSE payment_status
+                    END
+                WHERE id = ?
+                """,
+                (status, status, status, alert_id),
+            )
+            return cur.rowcount > 0
+
+    def update_alert_status_and_reason(
+        self,
+        alert_id: int,
+        status: str,
+        reason: str,
+        product_type: str = "",
+        payment_status: str = "",
+    ) -> bool:
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE price_alerts
+                SET status = ?,
+                    reason = ?,
+                    product_type = CASE WHEN ? != '' THEN ? ELSE product_type END,
+                    payment_status = CASE
+                        WHEN ? != '' THEN ?
+                        WHEN COALESCE(NULLIF(?, ''), product_type) = 'channel_resale'
+                             AND ? = 'manual_required' THEN 'unpaid'
+                        WHEN COALESCE(NULLIF(?, ''), product_type) = 'channel_resale'
+                             AND ? = 'resolved' THEN 'paid'
+                        ELSE payment_status
+                    END
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    reason,
+                    product_type,
+                    product_type,
+                    payment_status,
+                    payment_status,
+                    product_type,
+                    status,
+                    product_type,
+                    status,
+                    alert_id,
+                ),
+            )
+            return cur.rowcount > 0
+
+    def update_alert_product_type(
+        self,
+        alert_id: int,
+        product_type: str,
+        payment_status: str = "",
+    ) -> bool:
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE price_alerts
+                SET product_type = ?,
+                    payment_status = ?
+                WHERE id = ?
+                """,
+                (product_type, payment_status, alert_id),
+            )
+            return cur.rowcount > 0
+
+    def update_alert_status_and_product_type(
+        self,
+        alert_id: int,
+        status: str,
+        product_type: str,
+    ) -> bool:
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE price_alerts
+                SET status = ?,
+                    product_type = ?,
+                    payment_status = CASE
+                        WHEN ? = 'channel_resale' AND ? = 'resolved' THEN 'paid'
+                        WHEN ? = 'channel_resale' THEN 'unpaid'
+                        ELSE ''
+                    END
+                WHERE id = ?
+                """,
+                (status, product_type, product_type, status, product_type, alert_id),
             )
             return cur.rowcount > 0
 

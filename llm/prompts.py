@@ -44,34 +44,101 @@ VISION_PRICE_TEMPLATE = """
 请只返回纯数字或 null。
 """
 
-FISHING_CHAT_TEMPLATE = """
-你是一个普通买家，正在二手平台向卖家询问商品情况。
+FISHING_INITIAL_CHAT_TEMPLATE = """
+你是闲鱼年卡商品类型判断和第一轮询问生成助手。
 
-必须遵守：
-- 不暴露价格监控、取证、合规检查目的。
-- 不威胁、不诱导、不冒充平台、品牌方或执法方。
-- 每次只问一个自然问题。
-- 回复要短，像真实买家聊天。
-- 优先确认：是否在售、实际成交价、规格版本、库存或发货。
-- 如果卖家已经明确实际价格和规格，should_stop 返回 true。
+任务：
+根据商品标题和价格，先判断商品属于哪种类型，再生成第一轮自然买家询问话术。
 
-商品信息：
-产品：{product_name}
-官方价：{official_price}
-页面价：{listing_price}
+类型：
+1. gray_account：灰产型，通常低价账号、会员时长一年、需要定期换号、售后换号、十五天或半个月更换。
+2. personal_transfer：个人闲置转让型，普通个人不用了转让，常见词包括自用、闲置、转让、用不上、不用了、剩余时长、转手。
+3. channel_resale：渠道贩卖型，通常一千多元，疑似渠道货源、库存、外流货源、长期不用换号、会员时长两年。
+4. short_term_low_price：短期低价型，商品不是年卡或长期权益，而是短期体验、短期会员、几天到几十天的低价商品。
+5. uncertain：信息不足，无法判断。
+
+类型判断规则：
+- 只有标题或原因明确体现个人自用、闲置、转让、剩余时长等个人转手特征，才判断 personal_transfer。
+- 价格在489到499附近且标题体现年卡或一年，优先判断 gray_account。
+- 价格低于1000且属于年卡或长期权益，优先判断 gray_account。
+- 价格一千多元且属于年卡或长期权益，优先判断 channel_resale。
+- 标题体现短期、体验、7天、15天、21天、月卡等短时长权益，判断 short_term_low_price。
+- 如果判断 personal_transfer，short_term_low_price，uncertain，message 返回空字符串，因为不用继续后续对话。
+
+首句模板：
+- 通用话术优先围绕“多长时间什么价格，需要换账号吗”。
+- 价格一千多元时，优先问“{listing_price}是两年吗，需要换账号吗”。
+- 价格489到499附近且标题明确一年时，问“{listing_price}是一年吗，需要换账号吗”。
+- 价格低于1000但标题时长不明确时，问“{listing_price}是一年还是两年，需要换账号吗”。
+
+话术要求：
+- 少用标点，少使用问号。
+- 两个问句之间用逗号连接。
+- 不要出现“灰产”“违规”“倒卖”等词。
+- gray_account、channel_resale 都要生成首句继续后续对话。
+- personal_transfer，short_term_low_price，uncertain 不生成首句。
+
+首句样例：
+- 458 + 标题明确一年：458是一年吗，需要换账号吗
+- 499 + 标题明确一年：499是一年吗，需要换账号吗
+- 499 + 标题只写年卡或一年两年都有：499是一年还是两年，需要换账号吗
+- 1299 + 标题明确或疑似两年：1299是两年吗，需要换账号吗
+- 1839 + 标题时长不明确：1839是两年吗，需要换账号吗
+- “需要换账号吗”，“458是一年吗”这类话术可以换个表述，避免多家店铺话术雷同，但要保持自然。
+
+输入：
 标题：{title}
-卖家：{seller_name}
+价格：{listing_price}
+产品：{product_name}
 乱价原因：{reason}
 
-已有聊天：
-{conversation}
-
-请返回 JSON：
+输出 JSON：
 {{
+  "product_type": "gray_account | personal_transfer | channel_resale | short_term_low_price | uncertain",
+  "confidence": "low | medium | high",
   "message": "下一句要发送的话",
-  "intent": "询问目的",
-  "should_stop": false,
-  "reason": "为什么继续或停止"
+  "reason": "为什么这样问"
+}}
+"""
+
+FISHING_CHAT_TEMPLATE = """
+你是闲鱼年卡商品钓鱼人员。
+
+任务：
+根据商品标题、价格、已发送问题、卖家回复，确认价格、会员时长和是否需要换号。
+
+类型：
+1. gray_account：灰产型，通常低价账号、会员时长一年、需要定期换号、售后换号、十五天或半个月更换。
+2. personal_transfer：个人闲置转让型，普通个人不用了转让，常见词包括自用、闲置、转让、用不上、不用了、剩余时长、转手。
+3. channel_resale：渠道贩卖型，通常一千多元，疑似渠道货源、库存、外流货源、长期不用换号、会员时长两年。
+4. short_term_low_price：短期低价型，商品不是年卡或长期权益，而是短期体验、短期会员、几天到几十天的低价商品。
+5. uncertain：信息不足，无法判断。
+
+核心规则：
+1. 只要卖家确认需要换号，尤其是15天或半个月换一次，标记为 gray_account 灰产账号类型，不需要拍单。
+2. 只要卖家确认一直不用换号，标记为 manual_payment_required，需要人工付款。
+3. 如果卖家只确认时长，没有回答是否换号，标记 need_ask_change_account，继续追问换号。
+4. 如果卖家只回答不用换号，没有确认时长，继续追问是一年还是两年。
+5. 如果信息冲突或含糊，标记 need_manual_review。
+
+话术要求：
+- 少用标点，不使用问号。
+- 两个问句之间用逗号连接。
+- 不要出现“灰产”“违规”“倒卖”等词。
+
+输入：
+标题：{title}
+价格：{listing_price}
+已发送问题：{question}
+卖家回复：{seller_reply}
+
+输出 JSON：
+{{
+  "tag": "gray_account | manual_payment_required | need_ask_change_account | need_manual_review | suspicious_low_price_no_change",
+  "need_order": true,
+  "need_follow_up": true,
+  "follow_up_message": "下一句建议追问，没有则为空",
+  "evidence": ["判断依据1", "判断依据2"]
 }}
 """
 
@@ -82,4 +149,5 @@ class PromptTemplates:
     SEARCH_KEYWORDS = SEARCH_KEYWORDS_TEMPLATE
     PRICE_JUDGE = PRICE_JUDGE_TEMPLATE
     VISION_PRICE = VISION_PRICE_TEMPLATE
+    FISHING_INITIAL_CHAT = FISHING_INITIAL_CHAT_TEMPLATE
     FISHING_CHAT = FISHING_CHAT_TEMPLATE

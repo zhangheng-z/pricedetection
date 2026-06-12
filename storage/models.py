@@ -34,6 +34,8 @@ class PriceAlert:
     judgment: str            # violation | suspicious
     reason: str = ""
     status: str = "pending"  # pending | fishing | resolved
+    product_type: str = ""
+    payment_status: str = ""
     spec_capture_mode: str = ""
     spec_capture_info: str = ""
     created_at: str = ""

@@ -1,8 +1,8 @@
 ﻿llm:
   provider: openai_compatible
-  model: qwen3.6-plus
-  api_key: sk-4600150dc42d4fd5a301b8b08fbcb924
-  api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+  model: deepseek-v4-flash
+  api_key: ${VECTORENGINE_API_KEY}
+  api_base: https://api.vectorengine.ai/v1
   temperature: 0.7
 schedule:
   runs_per_day: 2

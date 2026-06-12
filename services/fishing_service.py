@@ -1,4 +1,5 @@
 import json
+import re
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -24,6 +25,26 @@ class ReplyCheckSummary:
     updated: int = 0
     waiting: int = 0
     failed: int = 0
+
+
+@dataclass
+class FishingRuleDecision:
+    message: str = ""
+    tag: str = ""
+    status: str = ""
+    reason: str = ""
+    should_stop: bool = False
+    product_type: str = ""
+    payment_status: str = ""
+
+
+@dataclass
+class ProductTypeDecision:
+    product_type: str = "uncertain"
+    confidence: str = "low"
+    reason: str = ""
+    source: str = "local_rule"
+    message: str = ""
 
 
 class FishingService:
@@ -55,10 +76,21 @@ class FishingService:
     def list_messages(self, db_path: str, listing_id: int) -> list[dict]:
         return Database(db_path).list_fishing_messages_by_listing(listing_id)
 
-    def update_alert_status(self, db_path: str, alert_id: int, status: str) -> None:
+    PRODUCT_TYPES = {
+        "",
+        "gray_account",
+        "channel_resale",
+        "personal_transfer",
+        "short_term_low_price",
+        "uncertain",
+    }
+
+    def update_alert_status(self, db_path: str, alert_id: int, status: str, product_type: str = "") -> None:
         if status not in self.ALERT_STATUSES:
             raise ValueError(f"Unsupported alert status: {status}")
-        if not Database(db_path).update_alert_status(alert_id, status):
+        if product_type not in self.PRODUCT_TYPES:
+            raise ValueError(f"Unsupported product type: {product_type}")
+        if not Database(db_path).update_alert_status_and_product_type(alert_id, status, product_type):
             raise ValueError(f"Alert not found: {alert_id}")
 
     def delete_alert(self, db_path: str, alert_id: int) -> None:
@@ -130,6 +162,39 @@ class FishingService:
         agent = None
         try:
             llm = LLMClient(settings.llm) if settings.llm.api_key else None
+            product_type = self._build_initial_plan(alert, llm)
+            self._log(
+                f"[fishing] product type alert={alert_id}: "
+                f"type={product_type.product_type}, confidence={product_type.confidence}, "
+                f"source={product_type.source}, reason={product_type.reason}"
+            )
+            db.update_alert_product_type(
+                alert_id,
+                product_type.product_type,
+                self._initial_payment_status(product_type.product_type),
+            )
+            if product_type.product_type == "personal_transfer":
+                reason = f"个人闲置转让型：{product_type.reason or '商品信息体现个人闲置转让特征'}"
+                db.update_alert_status_and_reason(
+                    alert_id,
+                    "resolved",
+                    reason,
+                    product_type="personal_transfer",
+                )
+                db.update_fishing_session_status(
+                    session_id,
+                    "resolved",
+                    "personal_transfer",
+                    finished=True,
+                )
+                return FishingStartResult(
+                    session_id=session_id,
+                    alert_id=alert_id,
+                    message="",
+                    auto_sent=auto_send,
+                    status="resolved",
+                )
+
             agent = self._build_agent(db, alert, account, settings, llm, headless)
             self._log(f"[fishing] opening listing alert={alert_id} session={session_id}")
             page = await agent.start_chat_for_listing(alert["url"])
@@ -186,10 +251,32 @@ class FishingService:
                     f"[fishing] existing conversation detected session={session_id}, "
                     f"messages={len(conversation_messages)}"
                 )
+                decision = self._classify_dialogue_by_rules(alert, conversation_messages)
+                if decision.should_stop:
+                    db.update_alert_status_and_reason(
+                        alert_id,
+                        decision.status,
+                        decision.reason,
+                        product_type=decision.product_type,
+                        payment_status=decision.payment_status,
+                    )
+                    db.update_fishing_session_status(session_id, decision.status, decision.tag, finished=True)
+                    self._log(
+                        f"[fishing] rule decision session={session_id}: "
+                        f"tag={decision.tag}, status={decision.status}, reason={decision.reason}"
+                    )
+                    await agent.close_fishing_browser()
+                    return FishingStartResult(
+                        session_id=session_id,
+                        alert_id=alert_id,
+                        message="",
+                        auto_sent=auto_send,
+                        status=decision.status,
+                    )
                 message, llm_payload = self._build_reply_message(alert, llm, conversation_messages)
             else:
                 self._log(f"[fishing] no existing conversation detected session={session_id}")
-                message, llm_payload = self._build_initial_message(alert, llm)
+                message, llm_payload = self._build_initial_message(alert, product_type)
 
             should_stop = bool(llm_payload.get("should_stop")) if isinstance(llm_payload, dict) else False
             if should_stop:
@@ -253,26 +340,22 @@ class FishingService:
         if agent:
             await agent.close_fishing_browser()
 
-    def _build_initial_message(self, alert: dict, llm: Optional[LLMClient]) -> tuple[str, dict]:
-        if not llm:
-            return ("你好，这个还在吗？页面这个价格是实际到手价吗？", {"source": "fallback"})
-
-        prompt = PromptTemplates.FISHING_CHAT.format(
-            product_name=alert.get("product_name", ""),
-            official_price=alert.get("official_price", ""),
-            listing_price=alert.get("price", ""),
-            title=alert.get("title", ""),
-            seller_name=alert.get("seller_name", ""),
-            reason=alert.get("reason", ""),
-            conversation="无",
-        )
-        payload = llm.chat_json(messages=[{"role": "user", "content": prompt}])
-        if not isinstance(payload, dict):
-            raise ValueError("Fishing LLM response must be a JSON object.")
-        message = str(payload.get("message", "")).strip()
+    def _build_initial_message(self, alert: dict, plan: ProductTypeDecision) -> tuple[str, dict]:
+        message = self._normalize_chat_message_style(plan.message)
         if not message:
-            raise ValueError("Fishing LLM response has empty message.")
-        return (message, payload)
+            message = self._build_initial_message_by_rules(alert)
+        if not message:
+            message = "这个价格是一年还是两年，需要换号吗"
+        return (
+            message,
+            {
+                "source": plan.source,
+                "product_type": plan.product_type,
+                "confidence": plan.confidence,
+                "reason": plan.reason,
+                "should_stop": False,
+            },
+        )
 
     async def _run_auto_dialogue(
         self,
@@ -327,6 +410,22 @@ class FishingService:
                 db.update_alert_status(alert["alert_id"], "waiting_seller")
                 db.update_fishing_session_status(session_id, "waiting_seller", "waiting_seller_reply")
                 return "waiting_seller"
+
+            decision = self._classify_dialogue_by_rules(alert, conversation_messages)
+            if decision.should_stop:
+                db.update_alert_status_and_reason(
+                    alert["alert_id"],
+                    decision.status,
+                    decision.reason,
+                    product_type=decision.product_type,
+                    payment_status=decision.payment_status,
+                )
+                db.update_fishing_session_status(session_id, decision.status, decision.tag, finished=True)
+                self._log(
+                    f"[fishing] rule decision session={session_id}: "
+                    f"tag={decision.tag}, status={decision.status}, reason={decision.reason}"
+                )
+                return decision.status
 
             reply, reply_payload = self._build_reply_message(alert, llm, conversation_messages)
             should_stop = bool(reply_payload.get("should_stop")) if isinstance(reply_payload, dict) else False
@@ -397,33 +496,321 @@ class FishingService:
         llm: Optional[LLMClient],
         conversation_messages: list[dict],
     ) -> tuple[str, dict]:
-        conversation_lines = []
-        for message in conversation_messages[-8:]:
-            role = "卖家" if message.get("sender") == "seller" else "买家"
-            conversation_lines.append(f"{role}：{message.get('content', '')}")
+        rule_decision = self._build_follow_up_by_rules(alert, conversation_messages)
+        if rule_decision.message:
+            return (
+                rule_decision.message,
+                {
+                    "source": "local_rule",
+                    "intent": rule_decision.reason,
+                    "should_stop": False,
+                },
+            )
 
         if not llm:
             buyer_turns = sum(1 for message in conversation_messages if message.get("sender") == "buyer")
             if buyer_turns <= 1:
-                return ("这个是页面标的规格吗？现在可以直接按这个价格拍吗？", {"source": "fallback", "should_stop": False})
-            return ("好的，那现在拍下就是按这个价格发对吧？", {"source": "fallback", "should_stop": False})
+                return ("这个价格是一年还是两年，需要换号吗", {"source": "fallback", "should_stop": False})
+            return ("使用中需要换号吗", {"source": "fallback", "should_stop": False})
 
         prompt = PromptTemplates.FISHING_CHAT.format(
-            product_name=alert.get("product_name", ""),
-            official_price=alert.get("official_price", ""),
             listing_price=alert.get("price", ""),
             title=alert.get("title", ""),
-            seller_name=alert.get("seller_name", ""),
-            reason=alert.get("reason", ""),
-            conversation="\n".join(conversation_lines),
+            question=self._latest_dialogue_content(conversation_messages, "buyer"),
+            seller_reply=self._latest_dialogue_content(conversation_messages, "seller"),
         )
         payload = llm.chat_json(messages=[{"role": "user", "content": prompt}])
         if not isinstance(payload, dict):
             raise ValueError("Fishing LLM response must be a JSON object.")
-        message = str(payload.get("message", "")).strip()
+        message = str(payload.get("follow_up_message", "")).strip()
+        tag = str(payload.get("tag", "")).strip()
+        if not message and tag == "need_ask_change_account":
+            message = "使用中需要换账号吗"
+        if not message and tag in {"need_manual_review", "suspicious_low_price_no_change"}:
+            message = "这个价格是一年还是两年，需要换账号吗"
         if not message:
-            raise ValueError("Fishing LLM response has empty message.")
+            raise ValueError("Fishing LLM response has empty follow_up_message.")
+        message = self._normalize_chat_message_style(message)
+        payload["follow_up_message"] = message
         return (message, payload)
+
+    def _build_initial_message_by_rules(self, alert: dict) -> str:
+        price = self._alert_price(alert)
+        if price <= 0:
+            return ""
+
+        price_text = self._format_price_text(price)
+        duration = self._title_duration_state(alert.get("title", ""))
+        if self._looks_like_short_term(alert.get("title", "")):
+            return f"{price_text}是多久的，需要换账号吗"
+        if price < 1000:
+            if duration == "one_year":
+                return f"{price_text}是一年吗，需要换账号吗"
+            if duration == "two_year":
+                return f"{price_text}是两年吗，需要换账号吗"
+            return f"{price_text}是一年还是两年，需要换账号吗"
+
+        if duration == "one_year":
+            return f"{price_text}是一年还是两年，需要换账号吗"
+        return f"{price_text}是两年吗，需要换账号吗"
+
+    def _initial_payment_status(self, product_type: str) -> str:
+        return "unpaid" if product_type == "channel_resale" else ""
+
+    def _build_initial_plan(self, alert: dict, llm: Optional[LLMClient]) -> ProductTypeDecision:
+        if llm:
+            prompt = PromptTemplates.FISHING_INITIAL_CHAT.format(
+                product_name=alert.get("product_name", ""),
+                listing_price=self._format_price_text(self._alert_price(alert)),
+                title=alert.get("title", ""),
+                reason=alert.get("reason", ""),
+            )
+            try:
+                payload = llm.chat_json(messages=[{"role": "user", "content": prompt}])
+            except Exception as exc:
+                self._log(f"[fishing] product type LLM failed, fallback to local rule: {exc}")
+                payload = {}
+            if isinstance(payload, dict):
+                product_type = str(payload.get("product_type", "")).strip()
+                if product_type in {
+                    "gray_account",
+                    "personal_transfer",
+                    "channel_resale",
+                    "short_term_low_price",
+                    "uncertain",
+                }:
+                    message = self._normalize_chat_message_style(str(payload.get("message", "")).strip())
+                    return ProductTypeDecision(
+                        product_type=product_type,
+                        confidence=str(payload.get("confidence", "low")).strip() or "low",
+                        reason=str(payload.get("reason", "")).strip(),
+                        source="llm",
+                        message=message,
+                    )
+
+        return self._classify_product_type_by_rules(alert)
+
+    def _classify_product_type_by_rules(self, alert: dict) -> ProductTypeDecision:
+        text = f"{alert.get('title', '')}\n{alert.get('reason', '')}"
+        value = re.sub(r"\s+", "", str(text or "").lower())
+        price = self._alert_price(alert)
+        message = self._build_initial_message_by_rules(alert)
+
+        personal_patterns = (
+            "自用",
+            "闲置",
+            "转让",
+            "用不上",
+            "不用了",
+            "剩余",
+            "转手",
+            "出掉",
+            "回血",
+        )
+        if any(pattern in value for pattern in personal_patterns):
+            return ProductTypeDecision(
+                product_type="personal_transfer",
+                confidence="medium",
+                reason="标题或原因包含个人闲置转让特征",
+                message="",
+            )
+
+        if self._looks_like_short_term(value):
+            return ProductTypeDecision(
+                product_type="short_term_low_price",
+                confidence="medium",
+                reason="标题或原因包含短期低价时长特征",
+                message=message,
+            )
+
+        gray_patterns = (
+            "换号",
+            "共享",
+            "售后",
+            "15天",
+            "十五天",
+            "半个月",
+            "直登",
+            "账号",
+        )
+        if price < 1000 and (any(pattern in value for pattern in gray_patterns) or self._looks_like_long_term(value)):
+            return ProductTypeDecision(
+                product_type="gray_account",
+                confidence="medium",
+                reason="低价长期商品，疑似灰产账号型",
+                message=message,
+            )
+
+        channel_patterns = (
+            "渠道",
+            "库存",
+            "货源",
+            "外流",
+            "不用换号",
+            "无需换号",
+        )
+        if price >= 1000 and (any(pattern in value for pattern in channel_patterns) or self._looks_like_long_term(value)):
+            return ProductTypeDecision(
+                product_type="channel_resale",
+                confidence="medium",
+                reason="一千元以上长期商品，疑似渠道贩卖型",
+                message=message,
+            )
+
+        return ProductTypeDecision(reason="商品信息不足，无法预判类型", message=message)
+
+    def _build_follow_up_by_rules(self, alert: dict, conversation_messages: list[dict]) -> FishingRuleDecision:
+        seller_text = self._seller_text(conversation_messages)
+        if not seller_text:
+            return FishingRuleDecision()
+
+        duration = self._duration_from_text(seller_text)
+        change = self._account_change_state(seller_text)
+
+        if change == "unknown":
+            return FishingRuleDecision(message="使用中需要换账号吗", reason="补问是否需要换账号")
+        if duration == "unknown":
+            return FishingRuleDecision(message="这个价格是一年还是两年", reason="补问价格对应年份")
+        return FishingRuleDecision()
+
+    def _classify_dialogue_by_rules(self, alert: dict, conversation_messages: list[dict]) -> FishingRuleDecision:
+        seller_text = self._seller_text(conversation_messages)
+        if not seller_text:
+            return FishingRuleDecision()
+
+        price = self._alert_price(alert)
+        duration = self._duration_from_text(seller_text)
+        change = self._account_change_state(seller_text)
+
+        if change == "need_change":
+            return FishingRuleDecision(
+                tag="gray_account",
+                status="resolved",
+                reason="灰产账号类型：卖家确认使用过程中需要换号",
+                should_stop=True,
+                product_type="gray_account",
+            )
+        if change == "no_change":
+            return FishingRuleDecision(
+                tag="manual_payment_required",
+                status="manual_required",
+                reason="需要人工付款：卖家确认一直不用换账号",
+                should_stop=True,
+                product_type="channel_resale",
+                payment_status="unpaid",
+            )
+        return FishingRuleDecision()
+
+    def _alert_price(self, alert: dict) -> float:
+        try:
+            return float(alert.get("price") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _format_price_text(self, price: float) -> str:
+        return f"{float(price):g}"
+
+    def _normalize_chat_message_style(self, message: str) -> str:
+        value = str(message or "").strip()
+        value = re.sub(r"[？?。.!！]+", "", value)
+        value = re.sub(r"[，,、；;]+", "，", value)
+        return value.strip(" ，,、；;")
+
+    def _seller_text(self, conversation_messages: list[dict]) -> str:
+        return "\n".join(
+            str(message.get("content", "")).strip()
+            for message in conversation_messages
+            if message.get("sender") == "seller" and str(message.get("content", "")).strip()
+        )
+
+    def _latest_dialogue_content(self, conversation_messages: list[dict], sender: str) -> str:
+        for message in reversed(conversation_messages):
+            if message.get("sender") != sender:
+                continue
+            content = str(message.get("content", "")).strip()
+            if content:
+                return content
+        return ""
+
+    def _title_duration_state(self, title: str) -> str:
+        has_one = self._has_one_year(title)
+        has_two = self._has_two_year(title)
+        if has_one and not has_two:
+            return "one_year"
+        if has_two and not has_one:
+            return "two_year"
+        return "unknown"
+
+    def _duration_from_text(self, text: str) -> str:
+        if self._has_two_year(text):
+            return "two_year"
+        if self._has_one_year(text):
+            return "one_year"
+        return "unknown"
+
+    def _has_one_year(self, text: str) -> bool:
+        value = str(text or "")
+        return bool(re.search(r"(?<![两二2])(?:一|1)\s*年", value))
+
+    def _has_two_year(self, text: str) -> bool:
+        value = str(text or "")
+        return bool(re.search(r"(?:两|二|2)\s*年", value))
+
+    def _looks_like_short_term(self, text: str) -> bool:
+        value = re.sub(r"\s+", "", str(text or "").lower())
+        if any(pattern in value for pattern in ("短期", "体验", "月卡", "周卡", "天卡")):
+            return True
+        return bool(re.search(r"(?:[1-9]|1[0-9]|2[0-9]|3[01]|七|十五|二十一|21|15|7)天", value))
+
+    def _looks_like_long_term(self, text: str) -> bool:
+        value = re.sub(r"\s+", "", str(text or "").lower())
+        return any(pattern in value for pattern in ("年卡", "一年", "1年", "两年", "二年", "2年", "长期"))
+
+    def _account_change_state(self, text: str) -> str:
+        value = re.sub(r"\s+", "", str(text or "").lower())
+        no_change_patterns = (
+            "不用换号",
+            "不用换账号",
+            "不需要换号",
+            "不需要换账号",
+            "无需换号",
+            "无需换账号",
+            "不用换",
+            "不换号",
+            "不换账号",
+            "无需更换",
+            "不需要更换",
+            "一直用",
+            "一直不用换",
+            "同一个账号",
+            "固定账号",
+        )
+        if any(pattern in value for pattern in no_change_patterns):
+            return "no_change"
+
+        need_change_patterns = (
+            "需要换号",
+            "需要换账号",
+            "要换号",
+            "要换账号",
+            "得换号",
+            "得换账号",
+            "换号",
+            "换账号",
+            "更换账号",
+            "定期换",
+            "售后换",
+            "到期换",
+            "用不了换",
+            "15天",
+            "十五天",
+            "半个月",
+        )
+        if any(pattern in value for pattern in need_change_patterns):
+            return "need_change"
+        if re.search(r"(每|隔|[0-9一二三四五六七八九十]+天).*换", value):
+            return "need_change"
+        return "unknown"
 
     def _build_agent(
         self,

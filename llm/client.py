@@ -23,16 +23,22 @@ class TokenUsageStats:
 class LLMClient:
     """统一 LLM 客户端，支持 OpenAI 兼容接口和 Anthropic SDK"""
     _usage_stats = TokenUsageStats()
+    VECTORENGINE_API_BASE = "https://api.vectorengine.ai/v1"
+    VECTORENGINE_PRIMARY_MODEL = "deepseek-v4-flash"
+    VECTORENGINE_FALLBACK_MODEL = "gpt-5.4-mini"
+    VECTORENGINE_FAILURE_THRESHOLD = 3
 
     def __init__(self, config: LLMConfig):
         self.config = config
         self._client = None
+        self._vectorengine_primary_failures = 0
+        self._vectorengine_use_fallback = False
 
     def _get_openai_client(self):
         from openai import OpenAI
         return OpenAI(
             api_key=self.config.api_key,
-            base_url=self.config.api_base,
+            base_url=self._openai_base_url(),
         )
 
     def _get_anthropic_client(self):
@@ -50,7 +56,7 @@ class LLMClient:
     def chat(self, messages: List[Dict[str, str]], system: Optional[str] = None) -> str:
         client = self._ensure_client()
         kwargs: Dict[str, Any] = {
-            "model": self.config.model,
+            "model": self.current_model(),
             "temperature": self.config.temperature,
         }
 
@@ -68,7 +74,7 @@ class LLMClient:
                 msgs.append({"role": "system", "content": system})
             msgs.extend(messages)
             kwargs["messages"] = msgs
-            response = client.chat.completions.create(**kwargs)
+            response = self.create_openai_chat_completion(**kwargs)
             self.record_usage(response)
             return response.choices[0].message.content or ""
 
@@ -83,8 +89,56 @@ class LLMClient:
             return json.loads(text)
         except (json.JSONDecodeError, IndexError) as e:
             raise ValueError(
-                f"Failed to parse LLM response as JSON (model={self.config.model}): {e}\nRaw text: {text[:500]}"
+                f"Failed to parse LLM response as JSON (model={self.current_model()}): {e}\nRaw text: {text[:500]}"
             ) from e
+
+    def current_model(self) -> str:
+        if self._is_vectorengine_enabled():
+            if self._vectorengine_use_fallback:
+                return self.VECTORENGINE_FALLBACK_MODEL
+            return self.VECTORENGINE_PRIMARY_MODEL
+        return self.config.model
+
+    def create_openai_chat_completion(self, **kwargs: Any) -> Any:
+        client = self._ensure_client()
+        kwargs["model"] = kwargs.get("model") or self.current_model()
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception:
+            if not self._should_retry_with_vectorengine_fallback(kwargs["model"]):
+                raise
+            kwargs["model"] = self.VECTORENGINE_FALLBACK_MODEL
+            response = client.chat.completions.create(**kwargs)
+            self._vectorengine_use_fallback = True
+        if kwargs["model"] == self.VECTORENGINE_PRIMARY_MODEL:
+            self._vectorengine_primary_failures = 0
+        return response
+
+    def _openai_base_url(self) -> str:
+        if self._is_vectorengine_enabled():
+            return self.VECTORENGINE_API_BASE
+        return self.config.api_base
+
+    def _is_vectorengine_enabled(self) -> bool:
+        if self.config.provider == "anthropic":
+            return False
+        api_base = str(self.config.api_base or "").rstrip("/")
+        return (
+            "api.vectorengine.ai" in api_base
+            or self.config.model in {
+                self.VECTORENGINE_PRIMARY_MODEL,
+                self.VECTORENGINE_FALLBACK_MODEL,
+            }
+        )
+
+    def _should_retry_with_vectorengine_fallback(self, model: str) -> bool:
+        if not self._is_vectorengine_enabled() or model != self.VECTORENGINE_PRIMARY_MODEL:
+            return False
+        self._vectorengine_primary_failures += 1
+        if self._vectorengine_primary_failures < self.VECTORENGINE_FAILURE_THRESHOLD:
+            return False
+        self._vectorengine_use_fallback = True
+        return True
 
     @classmethod
     def reset_usage(cls) -> None:

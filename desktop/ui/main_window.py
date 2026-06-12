@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QAbstractSpinBox,
@@ -30,29 +31,11 @@ import yaml
 
 
 LLM_PRESETS = {
-    "DashScope / Qwen": {
+    "VectorEngine": {
         "provider": "openai_compatible",
-        "model": "qwen3.6-plus",
-        "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "api_key": "${DASHSCOPE_API_KEY}",
-    },
-    "DeepSeek": {
-        "provider": "openai_compatible",
-        "model": "deepseek-chat",
-        "api_base": "https://api.deepseek.com/v1",
-        "api_key": "${DEEPSEEK_API_KEY}",
-    },
-    "OpenAI / GPT": {
-        "provider": "openai_compatible",
-        "model": "gpt-4o-mini",
-        "api_base": "https://api.openai.com/v1",
-        "api_key": "${OPENAI_API_KEY}",
-    },
-    "Anthropic / Claude": {
-        "provider": "anthropic",
-        "model": "claude-3-5-sonnet-latest",
-        "api_base": "",
-        "api_key": "${ANTHROPIC_API_KEY}",
+        "model": "deepseek-v4-flash",
+        "api_base": "https://api.vectorengine.ai/v1",
+        "api_key": "${VECTORENGINE_API_KEY}",
     },
     "自定义 OpenAI-compatible": {
         "provider": "openai_compatible",
@@ -69,14 +52,31 @@ FISHING_ALERT_STATUSES = [
     "seller_replied",
     "manual_required",
     "failed",
-    "evidence_collected",
     "resolved",
 ]
+
+FISHING_STATUS_LABELS = {
+    "pending": "待处理",
+    "fishing": "钓鱼中",
+    "waiting_seller": "等待商家回复",
+    "seller_replied": "商家已回复",
+    "manual_required": "需人工处理",
+    "failed": "失败",
+    "resolved": "成功",
+}
 
 FISHING_JUDGMENT_LABELS = {
     "VIOLATION": "乱价",
     "DELIST": "需下架",
     "REVIEW": "需人工复核",
+}
+
+FISHING_PRODUCT_TYPE_LABELS = {
+    "gray_account": "灰产账号型",
+    "channel_resale": "渠道贩卖型",
+    "personal_transfer": "个人闲置转让型",
+    "short_term_low_price": "短期低价型",
+    "uncertain": "不确定",
 }
 
 class MainWindow(QMainWindow):
@@ -95,7 +95,7 @@ class MainWindow(QMainWindow):
     fishing_start_requested = Signal(int)
     fishing_open_listing_requested = Signal(int)
     fishing_messages_requested = Signal(int)
-    fishing_status_update_requested = Signal(int, str)
+    fishing_status_update_requested = Signal(int, str, str)
     fishing_delete_requested = Signal(list)
     fishing_batch_start_requested = Signal(list)
     fishing_batch_stop_requested = Signal()
@@ -135,7 +135,7 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget(self)
         tabs.addTab(self._build_run_tab(), "运行")
-        tabs.addTab(self._build_fishing_tab(), "询价跟进")
+        tabs.addTab(self._build_fishing_tab(), "钓鱼")
         layout.addWidget(tabs)
 
         self.setCentralWidget(central)
@@ -146,7 +146,7 @@ class MainWindow(QMainWindow):
         tabs = self.findChildren(QTabWidget)
         if tabs:
             tabs[0].setTabText(0, "监控运行")
-            tabs[0].setTabText(1, "询价跟进")
+            tabs[0].setTabText(1, "钓鱼")
 
         self.start_button.setText("开始运行")
         self.stop_button.setText("停止任务")
@@ -163,7 +163,7 @@ class MainWindow(QMainWindow):
         self.fishing_refresh_button.setText("刷新线索")
         self.fishing_messages_button.setText("查看会话")
         self.fishing_headless_checkbox.setText("无头模式")
-        self.fishing_batch_start_button.setText("批量询价")
+        self.fishing_batch_start_button.setText("批量钓鱼")
         self.fishing_batch_stop_button.setText("停止批量")
 
         if hasattr(self, "save_llm_config_button"):
@@ -182,7 +182,8 @@ class MainWindow(QMainWindow):
             "页面价",
             "官方价",
             "判断",
-            "状态",
+            "乱价类型",
+            "处理状态",
             "创建时间",
             "商品链接",
             "操作",
@@ -641,7 +642,7 @@ class MainWindow(QMainWindow):
         self.fishing_headless_checkbox = QCheckBox("无头模式", page)
         self.fishing_headless_checkbox.setChecked(True)
         self.fishing_review_button = QPushButton("复核 REVIEW", page)
-        self.fishing_batch_start_button = QPushButton("批量询价", page)
+        self.fishing_batch_start_button = QPushButton("批量钓鱼", page)
         self.fishing_batch_stop_button = QPushButton("停止批量", page)
         actions.addWidget(self.fishing_refresh_button)
         actions.addWidget(self.fishing_messages_button)
@@ -666,7 +667,10 @@ class MainWindow(QMainWindow):
         filters.addWidget(QLabel("判断", page))
         self.fishing_judgment_filter = QComboBox(page)
         filters.addWidget(self.fishing_judgment_filter)
-        filters.addWidget(QLabel("状态", page))
+        filters.addWidget(QLabel("乱价类型", page))
+        self.fishing_product_type_filter = QComboBox(page)
+        filters.addWidget(self.fishing_product_type_filter)
+        filters.addWidget(QLabel("处理状态", page))
         self.fishing_table_status_filter = QComboBox(page)
         filters.addWidget(self.fishing_table_status_filter)
         filters.addWidget(QLabel("创建时间", page))
@@ -681,7 +685,7 @@ class MainWindow(QMainWindow):
         filters_bar.setFixedHeight(45)
         layout.addWidget(filters_bar)
 
-        self.fishing_table = QTableWidget(0, 12, page)
+        self.fishing_table = QTableWidget(0, 13, page)
         self.fishing_table.setHorizontalHeaderLabels([
             "选择",
             "序号",
@@ -691,7 +695,8 @@ class MainWindow(QMainWindow):
             "页面价",
             "官方价",
             "判断",
-            "状态",
+            "乱价类型",
+            "处理状态",
             "创建时间",
             "商品链接",
             "操作",
@@ -703,12 +708,12 @@ class MainWindow(QMainWindow):
         self.fishing_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.fishing_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
         self.fishing_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
-        self.fishing_table.horizontalHeader().setSectionResizeMode(10, QHeaderView.Fixed)
         self.fishing_table.horizontalHeader().setSectionResizeMode(11, QHeaderView.Fixed)
+        self.fishing_table.horizontalHeader().setSectionResizeMode(12, QHeaderView.Fixed)
         self.fishing_table.setColumnWidth(0, 46)
         self.fishing_table.setColumnWidth(1, 52)
-        self.fishing_table.setColumnWidth(10, 68)
-        self.fishing_table.setColumnWidth(11, 168)
+        self.fishing_table.setColumnWidth(11, 68)
+        self.fishing_table.setColumnWidth(12, 168)
         self.fishing_table.setFixedHeight(486)
         self.fishing_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         layout.addWidget(self.fishing_table)
@@ -750,6 +755,7 @@ class MainWindow(QMainWindow):
         self.fishing_product_filter.currentTextChanged.connect(self._apply_fishing_filters)
         self.fishing_price_sort_combo.currentTextChanged.connect(self._apply_fishing_filters)
         self.fishing_judgment_filter.currentTextChanged.connect(self._apply_fishing_filters)
+        self.fishing_product_type_filter.currentTextChanged.connect(self._apply_fishing_filters)
         self.fishing_table_status_filter.currentTextChanged.connect(self._apply_fishing_filters)
         self.fishing_created_filter.currentTextChanged.connect(self._apply_fishing_filters)
         self.fishing_clear_filters_button.clicked.connect(self._reset_fishing_filters)
@@ -813,17 +819,14 @@ class MainWindow(QMainWindow):
         form.addRow("服务", self.llm_preset_combo)
 
         self.llm_provider_input = QComboBox(model_group)
-        self.llm_provider_input.addItems(["openai_compatible", "anthropic"])
+        self.llm_provider_input.addItems(["openai_compatible"])
         form.addRow("Provider", self.llm_provider_input)
 
         self.llm_model_input = QComboBox(model_group)
         self.llm_model_input.setEditable(True)
         self.llm_model_input.addItems([
-            "qwen3.6-plus",
-            "deepseek-chat",
-            "gpt-4o-mini",
-            "gpt-4o",
-            "claude-3-5-sonnet-latest",
+            "deepseek-v4-flash",
+            "gpt-5.4-mini",
         ])
         form.addRow("模型", self.llm_model_input)
 
@@ -1052,11 +1055,8 @@ class MainWindow(QMainWindow):
             sorted({str(alert.get("product_name", "")) for alert in alerts if alert.get("product_name")}),
         )
         self._set_judgment_filter_items(alerts)
-        self._set_filter_combo_items(
-            self.fishing_table_status_filter,
-            "全部状态",
-            FISHING_ALERT_STATUSES,
-        )
+        self._set_product_type_filter_items(alerts)
+        self._set_status_filter_items()
 
     def _set_filter_combo_items(self, combo: QComboBox, all_text: str, values: list[str]) -> None:
         current = combo.currentText()
@@ -1085,11 +1085,44 @@ class MainWindow(QMainWindow):
         self.fishing_judgment_filter.setCurrentIndex(index if index >= 0 else 0)
         self.fishing_judgment_filter.blockSignals(False)
 
+    def _set_status_filter_items(self) -> None:
+        current = self.fishing_table_status_filter.currentData()
+        self.fishing_table_status_filter.blockSignals(True)
+        self.fishing_table_status_filter.clear()
+        self.fishing_table_status_filter.addItem("全部处理状态", "")
+        for status in FISHING_ALERT_STATUSES:
+            self.fishing_table_status_filter.addItem(self._display_fishing_status(status), status)
+        index = self.fishing_table_status_filter.findData(current)
+        self.fishing_table_status_filter.setCurrentIndex(index if index >= 0 else 0)
+        self.fishing_table_status_filter.blockSignals(False)
+
+    def _set_product_type_filter_items(self, alerts: list[dict]) -> None:
+        current = self.fishing_product_type_filter.currentData()
+        values = list(FISHING_PRODUCT_TYPE_LABELS)
+        for alert in alerts:
+            product_type = str(alert.get("product_type", "")).strip()
+            if product_type and product_type not in values:
+                values.append(product_type)
+
+        self.fishing_product_type_filter.blockSignals(True)
+        self.fishing_product_type_filter.clear()
+        self.fishing_product_type_filter.addItem("全部乱价类型", "")
+        self.fishing_product_type_filter.addItem("未处理", "__empty__")
+        for product_type in values:
+            self.fishing_product_type_filter.addItem(
+                FISHING_PRODUCT_TYPE_LABELS.get(product_type, product_type),
+                product_type,
+            )
+        index = self.fishing_product_type_filter.findData(current)
+        self.fishing_product_type_filter.setCurrentIndex(index if index >= 0 else 0)
+        self.fishing_product_type_filter.blockSignals(False)
+
     def _apply_fishing_filters(self) -> None:
         alerts = list(self._fishing_alerts)
         product = self.fishing_product_filter.currentText()
         judgment = self.fishing_judgment_filter.currentData()
-        status = self.fishing_table_status_filter.currentText()
+        product_type = self.fishing_product_type_filter.currentData()
+        status = self.fishing_table_status_filter.currentData()
         created_index = self.fishing_created_filter.currentIndex()
         price_sort_index = self.fishing_price_sort_combo.currentIndex()
 
@@ -1100,8 +1133,19 @@ class MainWindow(QMainWindow):
                 alert for alert in alerts
                 if str(alert.get("judgment", "")).upper() == str(judgment).upper()
             ]
+        if self.fishing_product_type_filter.currentIndex() > 0:
+            if product_type == "__empty__":
+                alerts = [alert for alert in alerts if not str(alert.get("product_type", "")).strip()]
+            else:
+                alerts = [
+                    alert for alert in alerts
+                    if str(alert.get("product_type", "")).strip() == str(product_type)
+                ]
         if self.fishing_table_status_filter.currentIndex() > 0:
-            alerts = [alert for alert in alerts if str(alert.get("status", "")) == status]
+            alerts = [
+                alert for alert in alerts
+                if str(alert.get("status", "")) == str(status)
+            ]
         if created_index > 0:
             cutoff = self._fishing_created_cutoff(created_index)
             if cutoff is not None:
@@ -1123,6 +1167,7 @@ class MainWindow(QMainWindow):
         for combo in [
             self.fishing_product_filter,
             self.fishing_judgment_filter,
+            self.fishing_product_type_filter,
             self.fishing_table_status_filter,
             self.fishing_created_filter,
             self.fishing_price_sort_combo,
@@ -1207,12 +1252,32 @@ class MainWindow(QMainWindow):
 
     def _build_fishing_status_widget(self, status: str) -> QComboBox:
         status_combo = QComboBox(self.fishing_table)
-        status_combo.addItems(FISHING_ALERT_STATUSES)
-        status_index = status_combo.findText(status)
+        for status_value in FISHING_ALERT_STATUSES:
+            status_combo.addItem(self._display_fishing_status(status_value), status_value)
+        status_index = status_combo.findData(status)
         status_combo.setCurrentIndex(status_index if status_index >= 0 else 0)
         return status_combo
 
-    def _build_fishing_operation_widget(self, alert_id: int, status_combo: QComboBox) -> QWidget:
+    def _build_fishing_product_type_widget(self, product_type: str, payment_status: str = "") -> QComboBox:
+        product_type_combo = QComboBox(self.fishing_table)
+        product_type_combo.addItem("-", "")
+        for type_value, label in FISHING_PRODUCT_TYPE_LABELS.items():
+            product_type_combo.addItem(label, type_value)
+        type_index = product_type_combo.findData(str(product_type or ""))
+        product_type_combo.setCurrentIndex(type_index if type_index >= 0 else 0)
+        if product_type == "channel_resale":
+            payment_label = "已付款" if payment_status == "paid" else "未付款"
+            product_type_combo.setItemText(product_type_combo.currentIndex(), f"渠道贩卖型（{payment_label}）")
+            color = "#15803d" if payment_status == "paid" else "#b91c1c"
+            product_type_combo.setStyleSheet(f"QComboBox {{ color: {color}; }}")
+        return product_type_combo
+
+    def _build_fishing_operation_widget(
+        self,
+        alert_id: int,
+        status_combo: QComboBox,
+        product_type_combo: QComboBox,
+    ) -> QWidget:
         widget = QWidget(self.fishing_table)
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(4, 0, 4, 0)
@@ -1224,8 +1289,12 @@ class MainWindow(QMainWindow):
         update_button.setFixedSize(46, 22)
         self._refresh_widget_style(update_button)
         update_button.clicked.connect(
-            lambda _checked=False, row_alert_id=alert_id, combo=status_combo:
-            self.fishing_status_update_requested.emit(row_alert_id, combo.currentText())
+            lambda _checked=False, row_alert_id=alert_id, status=status_combo, product_type=product_type_combo:
+            self.fishing_status_update_requested.emit(
+                row_alert_id,
+                str(status.currentData() or ""),
+                str(product_type.currentData() or ""),
+            )
         )
         layout.addWidget(update_button)
 
@@ -1238,7 +1307,7 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(delete_button)
 
-        start_button = QPushButton("询价", widget)
+        start_button = QPushButton("钓鱼", widget)
         start_button.setProperty("role", "small")
         start_button.setFixedSize(46, 22)
         self._refresh_widget_style(start_button)
@@ -1252,6 +1321,27 @@ class MainWindow(QMainWindow):
         normalized = str(judgment or "").upper()
         return FISHING_JUDGMENT_LABELS.get(normalized, judgment)
 
+    def _display_fishing_status(self, status: str) -> str:
+        return FISHING_STATUS_LABELS.get(str(status or ""), status)
+
+    def _display_fishing_product_type(self, product_type: str, payment_status: str = "") -> str:
+        product_type = str(product_type or "").strip()
+        if not product_type:
+            return "-"
+        label = FISHING_PRODUCT_TYPE_LABELS.get(product_type, product_type)
+        if product_type == "channel_resale":
+            payment_label = "已付款" if payment_status == "paid" else "未付款"
+            return f"{label}（{payment_label}）"
+        return label
+
+    def _apply_fishing_product_type_style(self, item: QTableWidgetItem, product_type: str, payment_status: str) -> None:
+        if product_type != "channel_resale":
+            return
+        if payment_status == "paid":
+            item.setForeground(QColor("#15803d"))
+        else:
+            item.setForeground(QColor("#b91c1c"))
+
     def _render_fishing_alerts(self, alerts: list[dict], start_index: int = 0) -> None:
         self.fishing_table.setUpdatesEnabled(False)
         self.fishing_table.blockSignals(True)
@@ -1259,6 +1349,8 @@ class MainWindow(QMainWindow):
             self.fishing_table.setRowCount(len(alerts))
             for row_index, alert in enumerate(alerts):
                 judgment = str(alert.get("judgment", ""))
+                product_type = str(alert.get("product_type", ""))
+                payment_status = str(alert.get("payment_status", ""))
                 values = [
                     str(start_index + row_index + 1),
                     alert.get("product_name", ""),
@@ -1267,6 +1359,7 @@ class MainWindow(QMainWindow):
                     str(alert.get("price", "")),
                     str(alert.get("official_price", "")),
                     self._display_fishing_judgment(judgment),
+                    self._display_fishing_product_type(product_type, payment_status),
                     alert.get("status", ""),
                     alert.get("created_at", ""),
                 ]
@@ -1282,9 +1375,14 @@ class MainWindow(QMainWindow):
                         item.setData(Qt.UserRole, alert_id)
                     if column_index == 6:
                         item.setData(Qt.UserRole, judgment.upper())
+                    if column_index == 7:
+                        item.setData(Qt.UserRole, product_type)
+                        self._apply_fishing_product_type_style(item, product_type, payment_status)
                     self.fishing_table.setItem(row_index, column_index + 1, item)
+                product_type_widget = self._build_fishing_product_type_widget(product_type, payment_status)
+                self.fishing_table.setCellWidget(row_index, 8, product_type_widget)
                 status_widget = self._build_fishing_status_widget(str(alert.get("status", "")))
-                self.fishing_table.setCellWidget(row_index, 8, status_widget)
+                self.fishing_table.setCellWidget(row_index, 9, status_widget)
 
                 open_button = QPushButton("打开", self.fishing_table)
                 open_button.setProperty("role", "small")
@@ -1293,13 +1391,14 @@ class MainWindow(QMainWindow):
                 open_button.clicked.connect(
                     lambda _checked=False, row_alert_id=alert_id: self.fishing_open_listing_requested.emit(row_alert_id)
                 )
-                self.fishing_table.setCellWidget(row_index, 10, open_button)
+                self.fishing_table.setCellWidget(row_index, 11, open_button)
 
                 operation_widget = self._build_fishing_operation_widget(
                     alert_id,
                     status_widget,
+                    product_type_widget,
                 )
-                self.fishing_table.setCellWidget(row_index, 11, operation_widget)
+                self.fishing_table.setCellWidget(row_index, 12, operation_widget)
         finally:
             self.fishing_table.blockSignals(False)
             self.fishing_table.setUpdatesEnabled(True)
