@@ -68,18 +68,22 @@ class SearchEngine:
 
                     const number = clean(priceWrap.querySelector('[class*="number"]')?.textContent || '');
                     const decimal = clean(priceWrap.querySelector('[class*="decimal"]')?.textContent || '');
-                    const joined = `${number}${decimal}`.replace(/[^0-9.]/g, '');
+                    const normalizedDecimal = decimal && !decimal.includes('.') ? `.${decimal}` : decimal;
+                    const joined = `${number}${normalizedDecimal}`.replace(/[^0-9.]/g, '');
                     const price = parseFloat(joined);
                     return Number.isNaN(price) ? 0 : price;
                 };
 
                 const getTitle = (card) => {
                     const titleBox = card.querySelector('[class*="row1-wrap-title"]');
-                    const attrTitle = clean(titleBox?.getAttribute('title') || '');
-                    if (attrTitle) return attrTitle;
-
                     const mainTitle = clean(card.querySelector('[class*="main-title"]')?.textContent || '');
                     if (mainTitle) return mainTitle;
+
+                    const visibleTitle = clean(titleBox?.innerText || titleBox?.textContent || '');
+                    if (visibleTitle) return visibleTitle;
+
+                    const attrTitle = clean(titleBox?.getAttribute('title') || '');
+                    if (attrTitle) return attrTitle;
 
                     return clean(card.getAttribute('title') || '');
                 };

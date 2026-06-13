@@ -35,7 +35,6 @@ class FishingRuleDecision:
     reason: str = ""
     should_stop: bool = False
     product_type: str = ""
-    payment_status: str = ""
 
 
 @dataclass
@@ -59,6 +58,8 @@ class FishingService:
         "failed",
         "evidence_collected",
         "resolved",
+        "resolved_unpaid",
+        "resolved_paid",
     }
 
     def __init__(
@@ -98,6 +99,8 @@ class FishingService:
             raise ValueError(f"Unsupported alert status: {status}")
         if product_type not in self.PRODUCT_TYPES:
             raise ValueError(f"Unsupported product type: {product_type}")
+        if status in {"resolved_unpaid", "resolved_paid"} and product_type != "channel_resale":
+            raise ValueError("成功（待付款）和成功（已付款）仅适用于渠道贩卖型")
         judgment = str(judgment or "").upper()
         if judgment not in self.JUDGMENTS:
             raise ValueError(f"Unsupported judgment: {judgment}")
@@ -187,7 +190,6 @@ class FishingService:
             db.update_alert_product_type(
                 alert_id,
                 product_type.product_type,
-                self._initial_payment_status(product_type.product_type),
             )
             if product_type.product_type == "personal_transfer":
                 reason = f"个人闲置转让型：{product_type.reason or '商品信息体现个人闲置转让特征'}"
@@ -274,7 +276,6 @@ class FishingService:
                         decision.status,
                         decision.reason,
                         product_type=decision.product_type,
-                        payment_status=decision.payment_status,
                     )
                     db.update_fishing_session_status(session_id, decision.status, decision.tag, finished=True)
                     self._log(
@@ -434,7 +435,6 @@ class FishingService:
                     decision.status,
                     decision.reason,
                     product_type=decision.product_type,
-                    payment_status=decision.payment_status,
                 )
                 db.update_fishing_session_status(session_id, decision.status, decision.tag, finished=True)
                 self._log(
@@ -534,6 +534,7 @@ class FishingService:
             title=alert.get("title", ""),
             question=self._latest_dialogue_content(conversation_messages, "buyer"),
             seller_reply=self._latest_dialogue_content(conversation_messages, "seller"),
+            conversation_history=self._format_conversation_history(conversation_messages),
         )
         payload = llm.chat_json(messages=[{"role": "user", "content": prompt}])
         if not isinstance(payload, dict):
@@ -569,9 +570,6 @@ class FishingService:
         if duration == "one_year":
             return f"{price_text}是一年还是两年，需要换账号吗"
         return f"{price_text}是两年吗，需要换账号吗"
-
-    def _initial_payment_status(self, product_type: str) -> str:
-        return "unpaid" if product_type == "channel_resale" else ""
 
     def _build_initial_plan(self, alert: dict, llm: Optional[LLMClient]) -> ProductTypeDecision:
         if llm:
@@ -709,11 +707,10 @@ class FishingService:
         if change == "no_change":
             return FishingRuleDecision(
                 tag="manual_payment_required",
-                status="manual_required",
+                status="resolved_unpaid",
                 reason="需要人工付款：卖家确认一直不用换账号",
                 should_stop=True,
                 product_type="channel_resale",
-                payment_status="unpaid",
             )
         return FishingRuleDecision()
 
@@ -738,6 +735,16 @@ class FishingService:
             for message in conversation_messages
             if message.get("sender") == "seller" and str(message.get("content", "")).strip()
         )
+
+    def _format_conversation_history(self, conversation_messages: list[dict]) -> str:
+        lines = []
+        for message in conversation_messages:
+            content = str(message.get("content", "")).strip()
+            if not content:
+                continue
+            sender = "买家" if message.get("sender") == "buyer" else "卖家"
+            lines.append(f"{sender}：{content}")
+        return "\n".join(lines) if lines else "无"
 
     def _latest_dialogue_content(self, conversation_messages: list[dict], sender: str) -> str:
         for message in reversed(conversation_messages):

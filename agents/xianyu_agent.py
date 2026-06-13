@@ -1,6 +1,7 @@
 import asyncio
 import json
 import random
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -202,6 +203,37 @@ class XianyuAgent(BaseAgent):
             return "；".join(items)
 
         return ""
+
+    def _infer_year_count_from_text(self, text: str) -> str:
+        normalized = re.sub(r"\s+", "", (text or "").lower())
+        if any(token in normalized for token in ("两年", "2年")):
+            return "2"
+        if any(token in normalized for token in ("一年", "1年")):
+            return "1"
+        return ""
+
+    def _infer_year_count_from_price(self, price: Optional[float]) -> str:
+        if price is None:
+            return ""
+        if abs(float(price) - 2498.0) <= 0.5:
+            return "2"
+        if abs(float(price) - 1998.0) <= 0.5:
+            return "1"
+        return ""
+
+    def _with_year_spec_hint(self, offer: Dict[str, Any], intent: Dict[str, str]) -> Dict[str, Any]:
+        if intent.get("spec") != "year":
+            return offer
+        year_count = self._infer_year_count_from_text(str(offer.get("spec_text", "")))
+        if not year_count:
+            year_count = self._infer_year_count_from_price(offer.get("price"))
+        if year_count:
+            offer["year_count"] = year_count
+            suffix = "两年" if year_count == "2" else "一年"
+            spec_text = str(offer.get("spec_text", "")).strip()
+            if suffix not in spec_text:
+                offer["spec_text"] = f"{spec_text} {suffix}".strip()
+        return offer
 
     def _build_fishing_browser(self, headless: bool) -> BrowserManager:
         return BrowserManager(
@@ -1877,6 +1909,8 @@ class XianyuAgent(BaseAgent):
                 pass
             await AntiDetect.random_delay(1, 2)
             await self._wait_for_verification_appearance(detail_page, "after detail open")
+            detail_title = await self._extract_detail_title(detail_page, title)
+            detail_price = await self._extract_detail_display_price(detail_page)
 
             if not await self._click_buy_now(detail_page):
                 if await self._wait_for_verification_appearance(
@@ -1904,12 +1938,40 @@ class XianyuAgent(BaseAgent):
             if offer is None:
                 debug_path = await self._save_order_debug_snapshot(detail_page)
                 print(f"[{self.PLATFORM}] matching order spec/price not found, debug saved: {debug_path}", flush=True)
+            else:
+                offer["detail_title"] = detail_title
+                offer["detail_price"] = detail_price
             return offer
         except Exception as exc:
             print(f"[{self.PLATFORM}] failed to fetch order price: {exc}", flush=True)
             return None
         finally:
             await detail_page.close()
+
+    async def _extract_detail_title(self, page: Page, fallback: str = "") -> str:
+        value = await page.evaluate(
+            r"""
+            () => {
+                const clean = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const candidates = [];
+                document.querySelectorAll('span[class*="desc"], span[class*="Desc"]').forEach((el) => {
+                    if (!visible(el)) return;
+                    const text = clean(el.innerText || el.textContent || '');
+                    if (!text) return;
+                    candidates.push(text);
+                });
+                candidates.sort((a, b) => b.length - a.length);
+                return candidates[0] || '';
+            }
+            """
+        )
+        return str(value or fallback or "").strip()
 
     async def _click_buy_now(self, page: Page) -> bool:
         labels = [
@@ -2010,19 +2072,22 @@ class XianyuAgent(BaseAgent):
                     "spec_capture_info": self._format_spec_capture_info("order_text_only", order_text, price, []),
                     "force_decision": "DELIST",
                 }
-            return {
+            return self._with_year_spec_hint({
                 "price": price,
                 "spec_text": order_text,
                 "spec_capture_mode": "order_text_only",
                 "spec_capture_info": self._format_spec_capture_info("order_text_only", order_text, price, []),
-            } if price is not None else None
+            }, intent) if price is not None else None
 
         if not candidates:
             return None
 
         offers = []
         exact_candidates = [candidate for candidate in candidates if candidate.get("intent_match")]
-        for candidate in (exact_candidates or candidates)[:6]:
+        candidate_pool = exact_candidates or candidates
+        if intent.get("spec") == "year":
+            candidate_pool = sorted(candidate_pool, key=self._year_option_sort_key)
+        for candidate in candidate_pool[:6]:
             try:
                 clicked = await self._click_xianyu_option(page, candidate)
                 if not clicked:
@@ -2049,7 +2114,18 @@ class XianyuAgent(BaseAgent):
 
         if not offers:
             return None
-        return offers[0]
+        return self._with_year_spec_hint(offers[0], intent)
+
+    def _year_option_sort_key(self, candidate: Dict[str, Any]) -> tuple:
+        text = str(candidate.get("text", ""))
+        year_count = self._infer_year_count_from_text(text)
+        if year_count == "2":
+            return (0, -float(candidate.get("score") or 0))
+        if year_count == "1":
+            return (1, -float(candidate.get("score") or 0))
+        if "year" in candidate.get("kinds", []):
+            return (2, -float(candidate.get("score") or 0))
+        return (3, -float(candidate.get("score") or 0))
 
     async def _collect_xianyu_order_options(self, page: Page, intent: Dict[str, str]) -> Dict[str, Any]:
         return await page.evaluate(
@@ -2182,12 +2258,15 @@ class XianyuAgent(BaseAgent):
                     const clickText = clean(clickEl.innerText || clickEl.textContent || rawText);
                     const text = clickText.length <= 180 ? clickText : rawText;
                     const key = norm(text || rawText);
+                    const childSpecCount = directSpecChildCount(clickEl);
+                    const textLooksLikeOption = hasSpecToken(key) && key.length <= 40 && !rejectedShellText(key);
                     const optionLooksClickable = clickEl.matches('button, [role="button"], li, label') ||
-                        /sku|spec|prop|option|item/i.test(clickEl.className || '');
+                        /sku|spec|prop|option|item/i.test(clickEl.className || '') ||
+                        textLooksLikeOption;
                     const optionTextHasSpec = hasSpecToken(key);
                     const optionTextMatchesIntent = specMatches(key);
                     const optionSpecKinds = specKinds(key);
-                    const optionLooksLikeContainer = optionSpecKinds.length > 1 || directSpecChildCount(clickEl) >= 2;
+                    const optionLooksLikeContainer = optionSpecKinds.length > 1 || childSpecCount >= 2;
                     const optionSoldOut = isSoldOut(clickEl, text || rawText);
 
                     if (optionLooksClickable && optionTextHasSpec && !optionLooksLikeContainer && !optionSeen.has(key)) {
@@ -2290,6 +2369,179 @@ class XianyuAgent(BaseAgent):
                 );
                 if (matched) return matched;
                 return lines.find((line) => /适趣/i.test(line)) || '';
+            }
+            """
+        )
+        return str(value or "")
+
+    async def _collect_xianyu_order_options(self, page: Page, intent: Dict[str, str]) -> Dict[str, Any]:
+        return await page.evaluate(
+            r"""
+            (intent) => {
+                const clean = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const norm = (text) => clean(text).toLowerCase().replace(/\s+/g, '');
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const dayPattern = (days) => new RegExp(`${days}(?:天|日|day|days)`, 'i');
+                const monthPattern = /(?:\d+个月|\d+月会员|三个月|三月会员)/i;
+                const quarterPattern = /(?:季卡|季会员|三个月|三月会员|3个月|3月会员)/i;
+                const yearPattern = /(?:年卡|年会员|一年卡|两年卡|1年卡|2年卡|一年|两年|1年|2年|12个月|365天)/i;
+                const hasSpecToken = (value) => dayPattern(7).test(value) ||
+                    dayPattern(15).test(value) || dayPattern(21).test(value) ||
+                    monthPattern.test(value) || quarterPattern.test(value) || yearPattern.test(value);
+                const specKinds = (value) => {
+                    const kinds = [];
+                    if (dayPattern(7).test(value)) kinds.push('7d');
+                    if (dayPattern(15).test(value)) kinds.push('15d');
+                    if (dayPattern(21).test(value)) kinds.push('21d');
+                    if (monthPattern.test(value)) kinds.push('month');
+                    if (quarterPattern.test(value)) kinds.push('quarter');
+                    if (yearPattern.test(value)) kinds.push('year');
+                    return kinds;
+                };
+                const yearCount = (value) => {
+                    if (/(?:两年|2年)/.test(value)) return '2';
+                    if (/(?:一年|1年)/.test(value)) return '1';
+                    return '';
+                };
+                const specMatches = (value) => {
+                    if (intent.spec === '7d') return dayPattern(7).test(value);
+                    if (intent.spec === '15d') return dayPattern(15).test(value);
+                    if (intent.spec === '21d') return dayPattern(21).test(value);
+                    if (intent.spec === 'year') return yearPattern.test(value);
+                    return hasSpecToken(value);
+                };
+                const isSoldOut = (el, text) => {
+                    const classText = `${el.className || ''} ${el.getAttribute('aria-disabled') || ''} ${el.getAttribute('disabled') || ''}`.toLowerCase();
+                    return Boolean(
+                        el.hasAttribute('disabled') ||
+                        el.getAttribute('disabled') === 'true' ||
+                        el.getAttribute('aria-disabled') === 'true' ||
+                        /disabled|soldout|sold-out|empty|invalid|forbid/.test(classText) ||
+                        /(?:无库存|售罄|已售罄|暂无库存)/.test(text)
+                    );
+                };
+                const scoreSpec = (text) => {
+                    const value = norm(text);
+                    let score = 0;
+                    if (specMatches(value)) score += 60;
+                    if (intent.spec === 'year') {
+                        if (yearCount(value) === '2') score += 100;
+                        if (yearCount(value) === '1') score += 40;
+                        if (yearPattern.test(value)) score += 20;
+                    }
+                    score -= Math.max(0, value.length - 24) / 4;
+                    return score;
+                };
+
+                const optionSeen = new Set();
+                const optionTexts = [];
+                const candidates = [];
+                const elements = [];
+                document.querySelectorAll('span[class*="option"], span[class*="Option"]').forEach((el) => {
+                    if (!visible(el)) return;
+                    const text = clean(el.innerText || el.textContent || '');
+                    const key = norm(text);
+                    if (!key || optionSeen.has(key) || !hasSpecToken(key)) return;
+                    optionSeen.add(key);
+                    const token = `price-monitor-sku-${elements.length}`;
+                    el.setAttribute('data-price-monitor-sku-token', token);
+                    elements.push(el);
+                    const option = {
+                        index: elements.length - 1,
+                        token,
+                        text,
+                        option_price: null,
+                        score: scoreSpec(text),
+                        kinds: specKinds(key),
+                        intent_match: specMatches(key),
+                        year_count: yearCount(key),
+                        sold_out: isSoldOut(el, text),
+                    };
+                    optionTexts.push({...option});
+                    candidates.push(option);
+                });
+
+                candidates.sort((a, b) => b.score - a.score);
+                window.__priceMonitorSkuCandidates = elements;
+                return {
+                    has_options: optionTexts.length >= 2,
+                    options: optionTexts,
+                    candidates,
+                    order_text: clean(document.body.innerText || ''),
+                };
+            }
+            """,
+            intent,
+        )
+
+    async def _extract_xianyu_order_price(self, page: Page) -> Optional[float]:
+        value = await page.evaluate(
+            r"""
+            () => {
+                const clean = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const toPrice = (text) => {
+                    const match = clean(text).match(/[¥￥]\s*(\d+(?:\.\d+)?)/);
+                    if (!match) return null;
+                    const price = Number.parseFloat(match[1]);
+                    return Number.isFinite(price) && price > 0 ? price : null;
+                };
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const fromSelector = (selector) => {
+                    const items = Array.from(document.querySelectorAll(selector))
+                        .filter(visible)
+                        .map((el) => toPrice(el.innerText || el.textContent || ''))
+                        .filter((price) => price !== null);
+                    return items.length ? items[0] : null;
+                };
+                const moneyPrice = fromSelector('[class*="money"], [class*="Money"]');
+                if (moneyPrice !== null) return moneyPrice;
+                const singlePrice = fromSelector('[class*="price"], [class*="Price"]');
+                if (singlePrice !== null) return singlePrice;
+                const candidates = [];
+                for (const el of Array.from(document.querySelectorAll('body *'))) {
+                    if (!visible(el)) continue;
+                    const price = toPrice(el.innerText || el.textContent || '');
+                    if (price === null) continue;
+                    const context = clean((el.closest('section, div, form, main') || el).textContent || '');
+                    let score = 0;
+                    if (/(?:实付款|应付款|应付|合计|总计|订单金额|支付金额|需付款)/.test(context)) score += 100;
+                    if (/(?:订单信息|购买数量|确认订单|提交订单)/.test(document.body.innerText || '')) score += 30;
+                    candidates.push({price, score});
+                }
+                candidates.sort((a, b) => b.score - a.score);
+                return candidates.length ? candidates[0].price : null;
+            }
+            """
+        )
+        return float(value) if value else None
+
+    async def _extract_xianyu_order_item_text(self, page: Page) -> str:
+        value = await page.evaluate(
+            r"""
+            () => {
+                const clean = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const name = Array.from(document.querySelectorAll('[class*="name"], [class*="Name"]'))
+                    .filter(visible)
+                    .map((el) => clean(el.innerText || el.textContent || ''))
+                    .find(Boolean);
+                if (name) return name;
+                return clean(document.body.innerText || '');
             }
             """
         )

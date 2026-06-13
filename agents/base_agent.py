@@ -214,10 +214,6 @@ class BaseAgent:
                 "price": list_price,
                 "url": url,
             })
-            if not self._title_matches_search(title, keyword):
-                self.title_filtered_count += 1
-                continue
-
             if self._should_skip_ignored_list_price(list_price):
                 print(
                     f"[{self.PLATFORM}] skip detail: ignored list price {list_price}",
@@ -275,17 +271,31 @@ class BaseAgent:
                 await self._anti_risk_delay("post_detail_cooldown_seconds", "after omission recheck")
             if order_offer is None:
                 continue
+            detail_title = str(order_offer.get("detail_title") or "").strip()
+            if not detail_title:
+                detail_title = title
+            detail_price = order_offer.get("detail_price")
+            match_price = float(detail_price if detail_price is not None else list_price)
+            if self.raw_listings:
+                self.raw_listings[-1]["detail_title"] = detail_title
+                self.raw_listings[-1]["detail_price"] = detail_price
+
+            if not self._title_matches_search(detail_title, keyword):
+                self.title_filtered_count += 1
+                continue
+
             final_price = order_offer["price"]
             print(
                 f"[{self.PLATFORM}] order price resolved: {order_offer['price']} "
-                f"(spec={order_offer.get('spec_text', '')[:40]}, list price={list_price})",
+                f"(spec={order_offer.get('spec_text', '')[:40]}, list price={list_price}, "
+                f"detail price={match_price})",
                 flush=True,
             )
 
             listing = Listing(
                 platform=self.PLATFORM,
                 product_name=self.product.name,
-                title=title,
+                title=detail_title,
                 price=final_price,
                 seller_name=item.get("seller", ""),
                 url=url,
@@ -355,6 +365,104 @@ class BaseAgent:
 
     def _should_open_detail_by_list_price(self, list_price: float, official_price: float) -> bool:
         return self.price_judge.is_below_official(list_price, official_price)
+
+    def _is_single_spec_offer(self, offer: Dict[str, Any]) -> bool:
+        mode = str(offer.get("spec_capture_mode", "")).strip()
+        return mode in {"order_text_only", "detail_text_only"}
+
+    async def _extract_detail_title(self, page: Page, fallback: str = "") -> str:
+        value = await page.evaluate(
+            r"""
+            () => {
+                const clean = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const candidates = [];
+                const add = (text, score) => {
+                    const value = clean(text);
+                    if (!value || value.length < 4 || value.length > 500) return;
+                    if (/登录|注册|客服|收藏|购物车|搜索|举报/.test(value) && value.length < 18) return;
+                    candidates.push({text: value, score: score + Math.min(value.length, 180) / 10});
+                };
+
+                document.querySelectorAll('h1, [class*="title"], [class*="Title"]').forEach((el) => {
+                    if (!visible(el)) return;
+                    const className = String(el.className || '');
+                    const score =
+                        (el.tagName === 'H1' ? 100 : 0) +
+                        (/title/i.test(className) ? 70 : 0) +
+                        20;
+                    add(el.innerText || el.textContent || '', score);
+                });
+
+                const seen = new Set();
+                return candidates
+                    .sort((a, b) => b.score - a.score)
+                    .filter((item) => {
+                        const key = item.text.replace(/\s+/g, '');
+                        if (seen.has(key)) return false;
+                        seen.add(key);
+                        return true;
+                    })[0]?.text || '';
+            }
+            """
+        )
+        return str(value or fallback or "").strip()
+
+    async def _extract_detail_display_price(self, page: Page) -> Optional[float]:
+        value = await page.evaluate(
+            r"""
+            () => {
+                const clean = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const parsePrice = (text, allowBareSingle = false) => {
+                    const value = clean(text).replace(/,/g, '');
+                    const range = value.match(/(?:¥|￥|RMB)?\s*(\d+(?:\.\d+)?)\s*(?:-|~|–|—|－|至|到)\s*(\d+(?:\.\d+)?)/i);
+                    const single = range ||
+                        value.match(/(?:¥|￥|RMB)\s*(\d+(?:\.\d+)?)/i) ||
+                        (allowBareSingle ? value.match(/(?:^|[^\d])(\d+(?:\.\d+)?)(?!\d)/) : null);
+                    if (!single) return null;
+                    const price = Number.parseFloat(single[1]);
+                    return Number.isFinite(price) && price > 0 ? price : null;
+                };
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const candidates = [];
+                for (const el of Array.from(document.querySelectorAll('body *'))) {
+                    if (!visible(el)) continue;
+                    const ownText = clean(Array.from(el.childNodes)
+                        .filter((node) => node.nodeType === Node.TEXT_NODE)
+                        .map((node) => node.textContent)
+                        .join(' '));
+                    const text = ownText || clean(el.textContent);
+                    const rect = el.getBoundingClientRect();
+                    const className = String(el.className || '');
+                    const context = clean((el.closest('section, div, main') || el).textContent || '');
+                    const allowBareSingle = /price|Price|sale|amount/.test(className) ||
+                        /价|券后|到手|促销|优惠|售价|价格/.test(context);
+                    const price = parsePrice(text, allowBareSingle);
+                    if (price === null) continue;
+                    let score = 0;
+                    if (/price|Price|sale|amount/.test(className)) score += 80;
+                    if (/价|券后|到手|促销|优惠|售价|价格/.test(context)) score += 50;
+                    if (/销量|评价|付款|月销|库存|运费/.test(context)) score -= 50;
+                    score += Math.max(0, 600 - rect.top) / 20;
+                    score += Math.min(Number.parseFloat(getComputedStyle(el).fontSize) || 0, 48);
+                    candidates.push({price, score});
+                }
+                candidates.sort((a, b) => b.score - a.score);
+                return candidates[0]?.price ?? null;
+            }
+            """
+        )
+        return float(value) if value else None
 
     async def _goto_next_results_page(self, page: Page) -> bool:
         return False

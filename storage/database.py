@@ -64,7 +64,6 @@ class Database:
                     reason TEXT DEFAULT '',
                     status TEXT DEFAULT 'pending',
                     product_type TEXT DEFAULT '',
-                    payment_status TEXT DEFAULT '',
                     spec_capture_mode TEXT DEFAULT '',
                     spec_capture_info TEXT DEFAULT '',
                     created_at TEXT DEFAULT (datetime('now', 'localtime')),
@@ -137,7 +136,7 @@ class Database:
             self._ensure_column(conn, "price_alerts", "spec_capture_mode", "TEXT DEFAULT ''")
             self._ensure_column(conn, "price_alerts", "spec_capture_info", "TEXT DEFAULT ''")
             self._ensure_column(conn, "price_alerts", "product_type", "TEXT DEFAULT ''")
-            self._ensure_column(conn, "price_alerts", "payment_status", "TEXT DEFAULT ''")
+            self._migrate_payment_status_to_status(conn)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_fishing_messages_listing ON fishing_messages(listing_id)"
             )
@@ -149,6 +148,26 @@ class Database:
         }
         if column not in columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _migrate_payment_status_to_status(self, conn) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(price_alerts)").fetchall()
+        }
+        if "payment_status" not in columns:
+            return
+        conn.execute(
+            """
+            UPDATE price_alerts
+            SET status = CASE
+                WHEN product_type = 'channel_resale' AND payment_status = 'paid' THEN 'resolved_paid'
+                WHEN product_type = 'channel_resale' AND payment_status = 'unpaid' THEN 'resolved_unpaid'
+                WHEN product_type = 'channel_resale' AND status = 'manual_required' THEN 'resolved_unpaid'
+                ELSE status
+            END
+            """
+        )
+        conn.execute("ALTER TABLE price_alerts DROP COLUMN payment_status")
 
     def save_run(self, run: SearchRun) -> int:
         with self._get_conn() as conn:
@@ -291,7 +310,6 @@ class Database:
                     a.reason,
                     a.status,
                     a.product_type,
-                    a.payment_status,
                     COALESCE(NULLIF(a.spec_capture_mode, ''), l.spec_capture_mode, '') AS spec_capture_mode,
                     COALESCE(NULLIF(a.spec_capture_info, ''), l.spec_capture_info, '') AS spec_capture_info,
                     a.created_at,
@@ -316,7 +334,9 @@ class Database:
                       'manual_required',
                       'failed',
                       'evidence_collected',
-                      'resolved'
+                      'resolved',
+                      'resolved_unpaid',
+                      'resolved_paid'
                   )
                   AND a.judgment IN ('VIOLATION', 'SUSPECTED', 'DELIST', 'REVIEW', 'NORMAL')
                 ORDER BY
@@ -350,7 +370,6 @@ class Database:
                     a.reason,
                     a.status,
                     a.product_type,
-                    a.payment_status,
                     COALESCE(NULLIF(a.spec_capture_mode, ''), l.spec_capture_mode, '') AS spec_capture_mode,
                     COALESCE(NULLIF(a.spec_capture_info, ''), l.spec_capture_info, '') AS spec_capture_info,
                     a.created_at,
@@ -444,7 +463,6 @@ class Database:
                     a.reason,
                     a.status,
                     a.product_type,
-                    a.payment_status,
                     COALESCE(NULLIF(a.spec_capture_mode, ''), l.spec_capture_mode, '') AS spec_capture_mode,
                     COALESCE(NULLIF(a.spec_capture_info, ''), l.spec_capture_info, '') AS spec_capture_info,
                     l.seller_name,
@@ -556,15 +574,10 @@ class Database:
             cur = conn.execute(
                 """
                 UPDATE price_alerts
-                SET status = ?,
-                    payment_status = CASE
-                        WHEN product_type = 'channel_resale' AND ? = 'resolved' THEN 'paid'
-                        WHEN product_type = 'channel_resale' AND ? = 'manual_required' THEN 'unpaid'
-                        ELSE payment_status
-                    END
+                SET status = ?
                 WHERE id = ?
                 """,
-                (status, status, status, alert_id),
+                (status, alert_id),
             )
             return cur.rowcount > 0
 
@@ -574,7 +587,6 @@ class Database:
         status: str,
         reason: str,
         product_type: str = "",
-        payment_status: str = "",
     ) -> bool:
         with self._get_conn() as conn:
             cur = conn.execute(
@@ -582,15 +594,7 @@ class Database:
                 UPDATE price_alerts
                 SET status = ?,
                     reason = ?,
-                    product_type = CASE WHEN ? != '' THEN ? ELSE product_type END,
-                    payment_status = CASE
-                        WHEN ? != '' THEN ?
-                        WHEN COALESCE(NULLIF(?, ''), product_type) = 'channel_resale'
-                             AND ? = 'manual_required' THEN 'unpaid'
-                        WHEN COALESCE(NULLIF(?, ''), product_type) = 'channel_resale'
-                             AND ? = 'resolved' THEN 'paid'
-                        ELSE payment_status
-                    END
+                    product_type = CASE WHEN ? != '' THEN ? ELSE product_type END
                 WHERE id = ?
                 """,
                 (
@@ -598,12 +602,6 @@ class Database:
                     reason,
                     product_type,
                     product_type,
-                    payment_status,
-                    payment_status,
-                    product_type,
-                    status,
-                    product_type,
-                    status,
                     alert_id,
                 ),
             )
@@ -613,17 +611,15 @@ class Database:
         self,
         alert_id: int,
         product_type: str,
-        payment_status: str = "",
     ) -> bool:
         with self._get_conn() as conn:
             cur = conn.execute(
                 """
                 UPDATE price_alerts
-                SET product_type = ?,
-                    payment_status = ?
+                SET product_type = ?
                 WHERE id = ?
                 """,
-                (product_type, payment_status, alert_id),
+                (product_type, alert_id),
             )
             return cur.rowcount > 0
 
@@ -638,15 +634,10 @@ class Database:
                 """
                 UPDATE price_alerts
                 SET status = ?,
-                    product_type = ?,
-                    payment_status = CASE
-                        WHEN ? = 'channel_resale' AND ? = 'resolved' THEN 'paid'
-                        WHEN ? = 'channel_resale' THEN 'unpaid'
-                        ELSE ''
-                    END
+                    product_type = ?
                 WHERE id = ?
                 """,
-                (status, product_type, product_type, status, product_type, alert_id),
+                (status, product_type, alert_id),
             )
             return cur.rowcount > 0
 
@@ -663,19 +654,11 @@ class Database:
                 UPDATE price_alerts
                 SET judgment = ?,
                     status = ?,
-                    product_type = ?,
-                    payment_status = CASE
-                        WHEN ? = 'channel_resale' AND ? = 'resolved' THEN 'paid'
-                        WHEN ? = 'channel_resale' THEN 'unpaid'
-                        ELSE ''
-                    END
+                    product_type = ?
                 WHERE id = ?
                 """,
                 (
                     judgment,
-                    status,
-                    product_type,
-                    product_type,
                     status,
                     product_type,
                     alert_id,

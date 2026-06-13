@@ -1,3 +1,4 @@
+import re
 from typing import Optional, Dict, List
 from llm.client import LLMClient
 from llm.prompts import PRICE_JUDGE_TEMPLATE, SEARCH_KEYWORDS_TEMPLATE
@@ -9,6 +10,11 @@ SKU_RULES = {
     "CN_YEAR": {"version": "CN", "period": "YEAR", "official_price": 2498.0},
     "EN_21D": {"version": "EN", "period": "21D", "official_price": 39.9},
     "EN_YEAR": {"version": "EN", "period": "YEAR", "official_price": 2198.0},
+}
+
+CN_YEAR_OFFICIAL_PRICES = {
+    "1": 1998.0,
+    "2": 2498.0,
 }
 
 PRICE_TOLERANCE = 0.5
@@ -28,17 +34,6 @@ TARGET_KEYWORDS = (
 CN_KEYWORDS = ("\u4e2d\u6587", "\u4e2d\u6587\u9605\u8bfb")
 CN_FALLBACK_KEYWORDS = ("\u8bc6\u5b57", "\u6c49\u5b57")
 EN_KEYWORDS = ("\u82f1\u6587", "\u82f1\u8bed", "english", "\u82f1\u6587\u9605\u8bfb")
-LOW_PRICE_BAIT_KEYWORDS = (
-    "\u79c1\u804a",
-    "\u5ba2\u670d",
-    "\u62cd\u524d\u8054\u7cfb",
-    "\u4f4e\u4ef7",
-    "\u7279\u4ef7",
-    "\u76f4\u5145",
-    "\u4e00\u53e3\u4ef7",
-    "\u6539\u4ef7",
-    "\u5230\u8d26",
-)
 
 EXCLUDED_BRAND_KEYWORDS = ("\u8df3\u8df3\u8c61",)
 
@@ -53,7 +48,7 @@ class PriceJudge:
         return price < official_price - PRICE_TOLERANCE
 
     def is_suspiciously_low(self, price: float, official_price: float) -> bool:
-        return price < official_price * 0.5
+        return price < official_price * 0.05 and price < 9.9
 
     def analyze_listing(
         self,
@@ -109,12 +104,12 @@ class PriceJudge:
             evidence.append("\u5468\u671f\u4f18\u5148\u6765\u6e90\uff1a\u5df2\u9009\u89c4\u683c")
         evidence.append(f"\u4ef7\u683c\uff1a{price}")
 
-        has_bait_words = any(word in text for word in LOW_PRICE_BAIT_KEYWORDS)
         lowest_known_price = min(
             rule["official_price"]
             for rule in SKU_RULES.values()
             if float(rule["official_price"]) > 0
         )
+        suspicious_reference_price = float(official_price or lowest_known_price)
 
         if len(version_candidates) != 1:
             return self._analysis_result(
@@ -129,16 +124,24 @@ class PriceJudge:
             )
 
         if len(period_candidates) != 1:
-            decision = "SUSPECTED" if price < lowest_known_price and has_bait_words else "REVIEW"
+            suspicious_threshold = suspicious_reference_price * 0.05
+            decision = "SUSPECTED" if 0 < price < suspicious_threshold and price < 9.9 else "REVIEW"
             return self._analysis_result(
                 decision=decision,
                 risk_level="HIGH" if decision == "SUSPECTED" else "MEDIUM",
-                price_judgement_type="LOW_PRICE_BAIT" if decision == "SUSPECTED" else "MULTI_SKU_SINGLE_PRICE",
+                price_judgement_type="EXTREME_LOW_PRICE" if decision == "SUSPECTED" else "MULTI_SKU_SINGLE_PRICE",
                 version_candidates=version_candidates,
                 period_candidates=period_candidates,
                 sku_candidates=sku_candidates,
-                reason="\u5468\u671f\u4e0d\u552f\u4e00\u6216\u65e0\u6cd5\u786e\u8ba4\uff0c\u4e0d\u5f3a\u884c\u5224\u65ad\u5177\u4f53SKU",
-                evidence=evidence,
+                reason=(
+                    f"\u5468\u671f\u4e0d\u552f\u4e00\u6216\u65e0\u6cd5\u786e\u8ba4\uff0c"
+                    f"\u4ef7\u683c {price} \u4f4e\u4e8e\u5b98\u65b9\u4ef7 {suspicious_reference_price} \u76845%\uff0c\u4e14\u4f4e\u4e8e9.9"
+                    if decision == "SUSPECTED"
+                    else "\u5468\u671f\u4e0d\u552f\u4e00\u6216\u65e0\u6cd5\u786e\u8ba4\uff0c\u4e0d\u5f3a\u884c\u5224\u65ad\u5177\u4f53SKU"
+                ),
+                evidence=evidence + [f"\u7591\u4f3c\u5f15\u6d41\u9608\u503c\uff1a\u4f4e\u4e8e{suspicious_threshold:g}\u4e14\u4f4e\u4e8e9.9"]
+                if decision == "SUSPECTED"
+                else evidence,
             )
 
         if len(sku_candidates) != 1:
@@ -155,6 +158,21 @@ class PriceJudge:
 
         sku_id = sku_candidates[0]
         sku_price = float(SKU_RULES[sku_id]["official_price"])
+        if sku_id == "CN_YEAR":
+            year_count = self._detect_year_count(spec_only_text) or self._detect_year_count(text)
+            if not year_count:
+                return self._analysis_result(
+                    decision="REVIEW",
+                    risk_level="MEDIUM",
+                    price_judgement_type="YEAR_CARD_AMBIGUOUS",
+                    version_candidates=version_candidates,
+                    period_candidates=period_candidates,
+                    sku_candidates=sku_candidates,
+                    reason="中文年卡未明确一年或两年，不强行按两年卡判定",
+                    evidence=evidence,
+                )
+            sku_price = CN_YEAR_OFFICIAL_PRICES[year_count]
+            evidence.append(f"年卡规格：{year_count}年")
         if price > 0 and self.is_below_official(price, sku_price):
             return self._analysis_result(
                 decision="VIOLATION",
@@ -196,6 +214,13 @@ class PriceJudge:
     def _normalize_text(self, text: str) -> str:
         return (text or "").lower().replace(" ", "")
 
+    def _detect_year_count(self, text: str) -> str:
+        if any(token in text for token in ("两年", "2年")):
+            return "2"
+        if any(token in text for token in ("一年", "1年")):
+            return "1"
+        return ""
+
     def _is_target_product(self, text: str) -> bool:
         return any(keyword in text for keyword in TARGET_KEYWORDS)
 
@@ -227,21 +252,26 @@ class PriceJudge:
             periods.append("15D")
         if any(token in text for token in ("21\u5929", "21\u65e5", "21day", "21days", "\u4e8c\u5341\u4e00\u5929", "\u4e09\u5468")):
             periods.append("21D")
+        if self._has_year_period(text):
+            periods.append("YEAR")
+        return periods
+
+    def _has_year_period(self, text: str) -> bool:
         if any(
             token in text
             for token in (
                 "\u5e74\u5361",
                 "\u5e74\u4f1a\u5458",
-                "\u4e00\u5e74",
-                "1\u5e74",
-                "\u4e24\u5e74",
-                "2\u5e74",
+                "\u4e00\u5e74\u5361",
+                "1\u5e74\u5361",
+                "\u4e24\u5e74\u5361",
+                "2\u5e74\u5361",
                 "12\u4e2a\u6708",
                 "365\u5929",
             )
         ):
-            periods.append("YEAR")
-        return periods
+            return True
+        return bool(re.search(r"(?:^|[^0-9\u4e00-\u9fff])(?:\u4e00\u5e74|1\u5e74|\u4e24\u5e74|2\u5e74)(?!\u5185|\u4ee5\u5185|\u4e4b\u5185)", text))
 
     def _build_sku_candidates(self, versions: List[str], periods: List[str]) -> List[str]:
         candidates = []
@@ -266,7 +296,7 @@ class PriceJudge:
     ) -> dict:
         if not self.llm:
             if self.is_suspiciously_low(price, official_price):
-                return {"judgment": "suspicious", "reason": "价格低于官方价50%以上，疑似引流"}
+                return {"judgment": "suspicious", "reason": "价格低于官方价的5%，疑似引流"}
             return {"judgment": "violation", "reason": f"价格{price}低于官方价{official_price}"}
 
         system = "你是一个电商价格合规分析师，严格按规则判断。"
@@ -286,7 +316,7 @@ class PriceJudge:
         except Exception as e:
             print(f"LLM judgment error: {e}, using fallback rules")
             if self.is_suspiciously_low(price, official_price):
-                return {"judgment": "suspicious", "reason": "LLM不可用，规则判定为疑似引流"}
+                return {"judgment": "suspicious", "reason": "LLM不可用，价格低于官方价的5%，规则判定为疑似引流"}
             return {"judgment": "violation", "reason": f"LLM不可用，规则判定价格违规"}
 
     def judge(self, price: float, official_price: float) -> str:

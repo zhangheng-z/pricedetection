@@ -1,8 +1,7 @@
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QAbstractSpinBox,
@@ -49,20 +48,22 @@ FISHING_ALERT_STATUSES = [
     "pending",
     "fishing",
     "waiting_seller",
-    "seller_replied",
     "manual_required",
     "failed",
     "resolved",
+    "resolved_unpaid",
+    "resolved_paid",
 ]
 
 FISHING_STATUS_LABELS = {
     "pending": "待处理",
     "fishing": "钓鱼中",
     "waiting_seller": "等待商家回复",
-    "seller_replied": "商家已回复",
     "manual_required": "需人工处理",
     "failed": "失败",
     "resolved": "成功",
+    "resolved_unpaid": "成功（待付款）",
+    "resolved_paid": "成功（已付款）",
 }
 
 FISHING_JUDGMENT_LABELS = {
@@ -115,6 +116,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Price Detection Desktop")
         self.resize(1180, 720)
         self._build_ui()
+        self._install_combo_wheel_filters()
         self._localize_text()
         self._apply_styles()
         self._style_tables()
@@ -141,6 +143,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(tabs)
 
         self.setCentralWidget(central)
+
+    def _install_combo_wheel_filters(self) -> None:
+        for combo in self.findChildren(QComboBox):
+            self._install_combo_wheel_filter(combo)
+
+    def _install_combo_wheel_filter(self, combo: QComboBox) -> QComboBox:
+        if not combo.property("_wheel_filter_installed"):
+            combo.installEventFilter(self)
+            combo.setProperty("_wheel_filter_installed", True)
+        return combo
+
+    def eventFilter(self, obj, event) -> bool:
+        if isinstance(obj, QComboBox) and event.type() == QEvent.Wheel:
+            if not obj.view().isVisible():
+                return True
+        return super().eventFilter(obj, event)
 
     def _localize_text(self) -> None:
         self.setWindowTitle("价格监控工作台")
@@ -750,7 +768,7 @@ class MainWindow(QMainWindow):
 
         self.fishing_refresh_button.clicked.connect(self.fishing_refresh_requested.emit)
         self.fishing_messages_button.clicked.connect(self._emit_selected_fishing_messages)
-        self.fishing_review_button.clicked.connect(self.fishing_review_requested.emit)
+        self.fishing_review_button.clicked.connect(self._emit_fishing_review)
         self.fishing_batch_start_button.clicked.connect(self._emit_selected_fishing_batch_start)
         self.fishing_batch_stop_button.clicked.connect(self.fishing_batch_stop_requested.emit)
         self.fishing_table.itemSelectionChanged.connect(self._sync_fishing_buttons)
@@ -1046,10 +1064,10 @@ class MainWindow(QMainWindow):
             self.llm_preset_combo.setCurrentText(preset)
             self.llm_preset_combo.blockSignals(False)
 
-    def set_fishing_alerts(self, alerts: list[dict]) -> None:
+    def set_fishing_alerts(self, alerts: list[dict], preserve_page: bool = False) -> None:
         self._fishing_alerts = alerts
         self._refresh_fishing_filter_options(alerts)
-        self._apply_fishing_filters()
+        self._apply_fishing_filters(reset_page=not preserve_page)
 
     def _refresh_fishing_filter_options(self, alerts: list[dict]) -> None:
         self._set_filter_combo_items(
@@ -1120,7 +1138,7 @@ class MainWindow(QMainWindow):
         self.fishing_product_type_filter.setCurrentIndex(index if index >= 0 else 0)
         self.fishing_product_type_filter.blockSignals(False)
 
-    def _apply_fishing_filters(self) -> None:
+    def _apply_fishing_filters(self, _value=None, reset_page: bool = True) -> None:
         alerts = list(self._fishing_alerts)
         product = self.fishing_product_filter.currentText()
         judgment = self.fishing_judgment_filter.currentData()
@@ -1163,7 +1181,8 @@ class MainWindow(QMainWindow):
             )
 
         self._filtered_fishing_alerts = alerts
-        self._fishing_current_page = 1
+        if reset_page:
+            self._fishing_current_page = 1
         self._render_current_fishing_page()
 
     def _reset_fishing_filters(self) -> None:
@@ -1253,13 +1272,43 @@ class MainWindow(QMainWindow):
                 continue
         return datetime.min
 
-    def _build_fishing_status_widget(self, status: str) -> QComboBox:
-        status_combo = QComboBox(self.fishing_table)
-        for status_value in FISHING_ALERT_STATUSES:
+    def _status_values_for_product_type(self, product_type: str) -> list[str]:
+        values = [
+            status
+            for status in FISHING_ALERT_STATUSES
+            if status not in {"resolved_unpaid", "resolved_paid"}
+        ]
+        if product_type == "channel_resale":
+            values.extend(["resolved_unpaid", "resolved_paid"])
+        return values
+
+    def _apply_fishing_status_style(self, status_combo: QComboBox) -> None:
+        status = str(status_combo.currentData() or "")
+        if status == "resolved_unpaid":
+            status_combo.setStyleSheet("QComboBox { color: #b91c1c; }")
+        elif status == "resolved_paid":
+            status_combo.setStyleSheet("QComboBox { color: #15803d; }")
+        else:
+            status_combo.setStyleSheet("")
+
+    def _sync_fishing_status_options(self, status_combo: QComboBox, product_type: str, current_status: str = "") -> None:
+        selected_status = str(current_status or status_combo.currentData() or "")
+        status_combo.blockSignals(True)
+        status_combo.clear()
+        for status_value in self._status_values_for_product_type(product_type):
             status_combo.addItem(self._display_fishing_status(status_value), status_value)
-        status_index = status_combo.findData(status)
+        status_index = status_combo.findData(selected_status)
+        if status_index < 0 and selected_status in {"resolved_unpaid", "resolved_paid"}:
+            status_index = status_combo.findData("resolved")
         status_combo.setCurrentIndex(status_index if status_index >= 0 else 0)
-        return status_combo
+        status_combo.blockSignals(False)
+        self._apply_fishing_status_style(status_combo)
+
+    def _build_fishing_status_widget(self, status: str, product_type: str = "") -> QComboBox:
+        status_combo = QComboBox(self.fishing_table)
+        self._sync_fishing_status_options(status_combo, product_type, status)
+        status_combo.currentIndexChanged.connect(lambda _index=0, combo=status_combo: self._apply_fishing_status_style(combo))
+        return self._install_combo_wheel_filter(status_combo)
 
     def _build_fishing_judgment_widget(self, judgment: str) -> QComboBox:
         judgment_combo = QComboBox(self.fishing_table)
@@ -1270,21 +1319,16 @@ class MainWindow(QMainWindow):
             judgment_combo.addItem(self._display_fishing_judgment(normalized), normalized)
         judgment_index = judgment_combo.findData(normalized)
         judgment_combo.setCurrentIndex(judgment_index if judgment_index >= 0 else 0)
-        return judgment_combo
+        return self._install_combo_wheel_filter(judgment_combo)
 
-    def _build_fishing_product_type_widget(self, product_type: str, payment_status: str = "") -> QComboBox:
+    def _build_fishing_product_type_widget(self, product_type: str) -> QComboBox:
         product_type_combo = QComboBox(self.fishing_table)
         product_type_combo.addItem("-", "")
         for type_value, label in FISHING_PRODUCT_TYPE_LABELS.items():
             product_type_combo.addItem(label, type_value)
         type_index = product_type_combo.findData(str(product_type or ""))
         product_type_combo.setCurrentIndex(type_index if type_index >= 0 else 0)
-        if product_type == "channel_resale":
-            payment_label = "已付款" if payment_status == "paid" else "未付款"
-            product_type_combo.setItemText(product_type_combo.currentIndex(), f"渠道贩卖型（{payment_label}）")
-            color = "#15803d" if payment_status == "paid" else "#b91c1c"
-            product_type_combo.setStyleSheet(f"QComboBox {{ color: {color}; }}")
-        return product_type_combo
+        return self._install_combo_wheel_filter(product_type_combo)
 
     def _build_fishing_operation_widget(
         self,
@@ -1309,7 +1353,7 @@ class MainWindow(QMainWindow):
             judgment=judgment_combo,
             status=status_combo,
             product_type=product_type_combo:
-            self.fishing_status_update_requested.emit(
+            self._emit_row_fishing_update(
                 row_alert_id,
                 str(judgment.currentData() or ""),
                 str(status.currentData() or ""),
@@ -1337,7 +1381,7 @@ class MainWindow(QMainWindow):
         start_button.setFixedSize(46, 22)
         self._refresh_widget_style(start_button)
         start_button.clicked.connect(
-            lambda _checked=False, row_alert_id=alert_id: self.fishing_start_requested.emit(row_alert_id)
+            lambda _checked=False, row_alert_id=alert_id: self._emit_row_fishing_start(row_alert_id)
         )
         layout.addWidget(start_button)
         return widget
@@ -1347,25 +1391,15 @@ class MainWindow(QMainWindow):
         return FISHING_JUDGMENT_LABELS.get(normalized, judgment)
 
     def _display_fishing_status(self, status: str) -> str:
+        if str(status or "") == "seller_replied":
+            return "商家已回复"
         return FISHING_STATUS_LABELS.get(str(status or ""), status)
 
-    def _display_fishing_product_type(self, product_type: str, payment_status: str = "") -> str:
+    def _display_fishing_product_type(self, product_type: str) -> str:
         product_type = str(product_type or "").strip()
         if not product_type:
             return "-"
-        label = FISHING_PRODUCT_TYPE_LABELS.get(product_type, product_type)
-        if product_type == "channel_resale":
-            payment_label = "已付款" if payment_status == "paid" else "未付款"
-            return f"{label}（{payment_label}）"
-        return label
-
-    def _apply_fishing_product_type_style(self, item: QTableWidgetItem, product_type: str, payment_status: str) -> None:
-        if product_type != "channel_resale":
-            return
-        if payment_status == "paid":
-            item.setForeground(QColor("#15803d"))
-        else:
-            item.setForeground(QColor("#b91c1c"))
+        return FISHING_PRODUCT_TYPE_LABELS.get(product_type, product_type)
 
     def _render_fishing_alerts(self, alerts: list[dict], start_index: int = 0) -> None:
         self.fishing_table.setUpdatesEnabled(False)
@@ -1375,7 +1409,6 @@ class MainWindow(QMainWindow):
             for row_index, alert in enumerate(alerts):
                 judgment = str(alert.get("judgment", ""))
                 product_type = str(alert.get("product_type", ""))
-                payment_status = str(alert.get("payment_status", ""))
                 values = [
                     str(start_index + row_index + 1),
                     alert.get("product_name", ""),
@@ -1384,7 +1417,7 @@ class MainWindow(QMainWindow):
                     str(alert.get("price", "")),
                     str(alert.get("official_price", "")),
                     self._display_fishing_judgment(judgment),
-                    self._display_fishing_product_type(product_type, payment_status),
+                    self._display_fishing_product_type(product_type),
                     alert.get("status", ""),
                     alert.get("created_at", ""),
                 ]
@@ -1402,13 +1435,20 @@ class MainWindow(QMainWindow):
                         item.setData(Qt.UserRole, judgment.upper())
                     if column_index == 7:
                         item.setData(Qt.UserRole, product_type)
-                        self._apply_fishing_product_type_style(item, product_type, payment_status)
                     self.fishing_table.setItem(row_index, column_index + 1, item)
-                product_type_widget = self._build_fishing_product_type_widget(product_type, payment_status)
+                product_type_widget = self._build_fishing_product_type_widget(product_type)
                 judgment_widget = self._build_fishing_judgment_widget(judgment)
                 self.fishing_table.setCellWidget(row_index, 7, judgment_widget)
                 self.fishing_table.setCellWidget(row_index, 8, product_type_widget)
-                status_widget = self._build_fishing_status_widget(str(alert.get("status", "")))
+                status_widget = self._build_fishing_status_widget(str(alert.get("status", "")), product_type)
+                product_type_widget.currentIndexChanged.connect(
+                    lambda _index=0,
+                    status=status_widget,
+                    product_type_combo=product_type_widget: self._sync_fishing_status_options(
+                        status,
+                        str(product_type_combo.currentData() or ""),
+                    )
+                )
                 self.fishing_table.setCellWidget(row_index, 9, status_widget)
 
                 open_button = QPushButton("打开", self.fishing_table)
@@ -1626,6 +1666,50 @@ class MainWindow(QMainWindow):
         if alert_id:
             self.fishing_messages_requested.emit(alert_id)
 
+    def _confirm_action(self, title: str, message: str) -> bool:
+        reply = QMessageBox.question(
+            self,
+            title,
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
+    def _emit_fishing_review(self) -> None:
+        if self._confirm_action(
+            "LLM复核",
+            "确定要对需人工复核的商品执行 LLM 复核吗？",
+        ):
+            self.fishing_review_requested.emit()
+
+    def _emit_row_fishing_update(
+        self,
+        alert_id: int,
+        judgment: str,
+        status: str,
+        product_type: str,
+    ) -> None:
+        if not alert_id:
+            return
+        if status in {"resolved_unpaid", "resolved_paid"} and product_type != "channel_resale":
+            self.show_error("成功（待付款）和成功（已付款）仅适用于乱价类型为“渠道贩卖型”的商品。")
+            return
+        if self._confirm_action(
+            "更新商品",
+            "确定更新这条商品的判断、乱价类型和处理状态吗？",
+        ):
+            self.fishing_status_update_requested.emit(alert_id, judgment, status, product_type)
+
+    def _emit_row_fishing_start(self, alert_id: int) -> None:
+        if not alert_id:
+            return
+        if self._confirm_action(
+            "钓鱼",
+            "确定要对这条商品线索开始钓鱼吗？",
+        ):
+            self.fishing_start_requested.emit(alert_id)
+
     def _emit_selected_fishing_delete(self) -> None:
         alert_ids = self._selected_fishing_alert_ids()
         if not alert_ids:
@@ -1668,5 +1752,8 @@ class MainWindow(QMainWindow):
 
     def _emit_selected_fishing_batch_start(self) -> None:
         alert_ids = self._selected_fishing_alert_ids()
-        if alert_ids:
+        if alert_ids and self._confirm_action(
+            "批量钓鱼",
+            f"确定要对选中的 {len(alert_ids)} 条商品线索开始批量钓鱼吗？",
+        ):
             self.fishing_batch_start_requested.emit(alert_ids)

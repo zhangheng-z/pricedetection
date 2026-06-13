@@ -262,10 +262,10 @@ class DesktopController:
                 return account
         return None
 
-    def refresh_fishing_alerts(self) -> None:
+    def refresh_fishing_alerts(self, preserve_page: bool = False) -> None:
         try:
             alerts = self.fishing_service.list_alerts(self._current_db_path())
-            self.window.set_fishing_alerts(alerts)
+            self.window.set_fishing_alerts(alerts, preserve_page=preserve_page)
             self.window.append_log(f"Fishing alerts loaded: {len(alerts)}")
         except Exception as exc:
             self.window.show_error(str(exc))
@@ -489,7 +489,7 @@ class DesktopController:
             for alert_id in selected_ids:
                 self.fishing_service.delete_alert(db_path, alert_id)
             self.window.append_log(f"Deleted {len(selected_ids)} alert(s): {', '.join(map(str, selected_ids))}.")
-            self.refresh_fishing_alerts()
+            self.refresh_fishing_alerts(preserve_page=True)
         except Exception as exc:
             self.window.show_error(str(exc))
 

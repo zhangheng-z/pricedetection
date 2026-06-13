@@ -1000,10 +1000,15 @@ class TaobaoAgent(BaseAgent):
             await detail_page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await AntiDetect.random_delay(2, 3)
             await self._wait_for_verification_appearance(detail_page, "after detail open")
+            detail_title = await self._extract_detail_title(detail_page, title)
+            detail_price = await self._extract_detail_display_price(detail_page)
             offer = await self._select_matching_order_offer(detail_page, keyword)
             if offer is None:
                 debug_path = await self._save_order_debug_snapshot(detail_page)
                 print(f"[{self.PLATFORM}] matching detail spec/price not found, debug saved: {debug_path}", flush=True)
+            else:
+                offer["detail_title"] = detail_title
+                offer["detail_price"] = detail_price
             return offer
         except Exception as exc:
             print(f"[{self.PLATFORM}] failed to fetch detail price: {exc}", flush=True)
