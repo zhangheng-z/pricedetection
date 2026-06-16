@@ -12,6 +12,7 @@ from desktop.ui.main_window import MainWindow
 from llm.client import LLMClient
 from services import MonitorService, RunOptions
 from services.fishing_service import FishingService
+from storage.database import Database
 
 
 class LogBridge(QObject):
@@ -532,9 +533,15 @@ class DesktopController:
         return None
 
     def _current_db_path(self) -> str:
-        return self.window.db_path_input.text().strip() or "data/price_monitor.db"
+        db_path = self.window.db_path_input.text().strip() or "data/price_monitor.db"
+        LLMClient.configure_usage_storage(db_path)
+        return db_path
 
     def _log_llm_usage(self) -> None:
-        usage = LLMClient.usage_snapshot()
+        usage = Database(self._current_db_path()).get_llm_token_usage_summary()
         self.window.set_token_usage(usage)
-        self.window.append_log(LLMClient.usage_summary())
+        self.window.append_log(
+            f"LLM token usage: requests={usage['requests']}, "
+            f"prompt={usage['prompt_tokens']}, completion={usage['completion_tokens']}, "
+            f"total={usage['total_tokens']}"
+        )

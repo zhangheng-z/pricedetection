@@ -110,12 +110,21 @@ class Database:
                     FOREIGN KEY (session_id) REFERENCES fishing_sessions(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS llm_token_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT DEFAULT (datetime('now', 'localtime'))
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_listings_platform ON listings(platform);
                 CREATE INDEX IF NOT EXISTS idx_listings_created ON listings(created_at);
                 CREATE INDEX IF NOT EXISTS idx_alerts_status ON price_alerts(status);
                 CREATE INDEX IF NOT EXISTS idx_runs_time ON search_runs(run_time);
                 CREATE INDEX IF NOT EXISTS idx_fishing_sessions_alert ON fishing_sessions(alert_id);
                 CREATE INDEX IF NOT EXISTS idx_fishing_messages_session ON fishing_messages(session_id);
+                CREATE INDEX IF NOT EXISTS idx_llm_token_usage_created ON llm_token_usage(created_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_listings_url_unique
                     ON listings(url)
                     WHERE url != '';
@@ -270,6 +279,41 @@ class Database:
                  1 if report.dingtalk_sent else 0),
             )
             return cur.lastrowid
+
+    def save_llm_token_usage(
+        self,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+    ) -> int:
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO llm_token_usage (prompt_tokens, completion_tokens, total_tokens)
+                VALUES (?, ?, ?)
+                """,
+                (prompt_tokens, completion_tokens, total_tokens),
+            )
+            return cur.lastrowid
+
+    def get_llm_token_usage_summary(self) -> dict:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS requests,
+                    COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                    COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens
+                FROM llm_token_usage
+                """
+            ).fetchone()
+            return {
+                "requests": int(row["requests"] or 0),
+                "prompt_tokens": int(row["prompt_tokens"] or 0),
+                "completion_tokens": int(row["completion_tokens"] or 0),
+                "total_tokens": int(row["total_tokens"] or 0),
+            }
 
     def get_alerts_by_date(self, date_str: str) -> List[PriceAlert]:
         with self._get_conn() as conn:

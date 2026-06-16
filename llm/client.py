@@ -23,6 +23,7 @@ class TokenUsageStats:
 class LLMClient:
     """统一 LLM 客户端，支持 OpenAI 兼容接口和 Anthropic SDK"""
     _usage_stats = TokenUsageStats()
+    _usage_db_path = "data/price_monitor.db"
     VECTORENGINE_API_BASE = "https://api.vectorengine.ai/v1"
     VECTORENGINE_PRIMARY_MODEL = "deepseek-v4-flash"
     VECTORENGINE_FALLBACK_MODEL = "gpt-5.4-mini"
@@ -145,6 +146,11 @@ class LLMClient:
         cls._usage_stats = TokenUsageStats()
 
     @classmethod
+    def configure_usage_storage(cls, db_path: str) -> None:
+        if db_path:
+            cls._usage_db_path = db_path
+
+    @classmethod
     def usage_snapshot(cls) -> dict:
         return cls._usage_stats.snapshot()
 
@@ -175,6 +181,25 @@ class LLMClient:
         cls._usage_stats.prompt_tokens += prompt_tokens
         cls._usage_stats.completion_tokens += completion_tokens
         cls._usage_stats.total_tokens += total_tokens
+        cls._save_usage_to_database(prompt_tokens, completion_tokens, total_tokens)
+
+    @classmethod
+    def _save_usage_to_database(
+        cls,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+    ) -> None:
+        try:
+            from storage.database import Database
+
+            Database(cls._usage_db_path).save_llm_token_usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+            )
+        except Exception as exc:
+            print(f"Failed to save LLM token usage: {exc}", flush=True)
 
     @staticmethod
     def _usage_value(usage: Any, *names: str) -> int:

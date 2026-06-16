@@ -349,6 +349,7 @@ def main() -> int:
     try:
         conn = connect_db(args.db)
         llm = load_llm()
+        llm.configure_usage_storage(args.db)
         print("提示词聊天测试已启动。你扮演商家，LLM 扮演买家。")
         print("命令：/new 换一个随机商品，/quit 退出。")
         while run_chat(conn, llm, args.price, args.show_prompt, args.retries, args.retry_delay):

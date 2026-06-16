@@ -113,6 +113,7 @@ FISHING_CHAT_TEMPLATE = """
 3. 如果卖家只确认时长，没有回答是否换号，标记 need_ask_change_account，继续追问换号。
 4. 如果卖家只回答不用换号，没有确认时长，继续追问是一年还是两年。
 5. 如果信息冲突或含糊,对于已有问题没有正面回复，标记 need_manual_review，不继续追问。
+6. 如果历史对话已经同时确认会员时长和是否需要换号，should_stop 返回 true，follow_up_message 返回空字符串。
 
 话术要求：
 - 少用问好,使用问号的情况为陈述句想表达问句形式。
@@ -129,9 +130,13 @@ FISHING_CHAT_TEMPLATE = """
 输出 JSON：
 {{
   "tag": "gray_account | manual_payment_required | need_ask_change_account | need_manual_review | suspicious_low_price_no_change",
+  "should_stop": true,
+  "status": "resolved | resolved_unpaid | manual_required | evidence_collected",
+  "product_type": "gray_account | channel_resale | uncertain",
   "need_order": true,
   "need_follow_up": true,
   "follow_up_message": "下一句建议追问，没有则为空",
+  "reason": "为什么继续追问或停止",
   "evidence": ["判断依据1", "判断依据2"]
 }}
 

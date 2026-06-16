@@ -158,6 +158,7 @@ class FishingService:
         auto_send: bool = False,
         headless: bool = False,
     ) -> FishingStartResult:
+        LLMClient.configure_usage_storage(db_path)
         db = Database(db_path)
         alert = db.get_fishing_alert(alert_id)
         if not alert:
@@ -187,22 +188,29 @@ class FishingService:
                 f"type={product_type.product_type}, confidence={product_type.confidence}, "
                 f"source={product_type.source}, reason={product_type.reason}"
             )
-            db.update_alert_product_type(
-                alert_id,
-                product_type.product_type,
-            )
-            if product_type.product_type == "personal_transfer":
-                reason = f"个人闲置转让型：{product_type.reason or '商品信息体现个人闲置转让特征'}"
+            if product_type.product_type in {"personal_transfer", "short_term_low_price"}:
+                type_labels = {
+                    "personal_transfer": "个人闲置转让型",
+                    "short_term_low_price": "短期低价型",
+                }
+                fallback_reasons = {
+                    "personal_transfer": "商品信息体现个人闲置转让特征",
+                    "short_term_low_price": "商品信息体现短期低价特征，无需继续对话取证",
+                }
+                reason = (
+                    f"{type_labels[product_type.product_type]}："
+                    f"{product_type.reason or fallback_reasons[product_type.product_type]}"
+                )
                 db.update_alert_status_and_reason(
                     alert_id,
                     "resolved",
                     reason,
-                    product_type="personal_transfer",
+                    product_type=product_type.product_type,
                 )
                 db.update_fishing_session_status(
                     session_id,
                     "resolved",
-                    "personal_transfer",
+                    product_type.product_type,
                     finished=True,
                 )
                 return FishingStartResult(
@@ -269,27 +277,28 @@ class FishingService:
                     f"[fishing] existing conversation detected session={session_id}, "
                     f"messages={len(conversation_messages)}"
                 )
-                decision = self._classify_dialogue_by_rules(alert, conversation_messages)
-                if decision.should_stop:
-                    db.update_alert_status_and_reason(
-                        alert_id,
-                        decision.status,
-                        decision.reason,
-                        product_type=decision.product_type,
-                    )
-                    db.update_fishing_session_status(session_id, decision.status, decision.tag, finished=True)
-                    self._log(
-                        f"[fishing] rule decision session={session_id}: "
-                        f"tag={decision.tag}, status={decision.status}, reason={decision.reason}"
-                    )
-                    await agent.close_fishing_browser()
-                    return FishingStartResult(
-                        session_id=session_id,
-                        alert_id=alert_id,
-                        message="",
-                        auto_sent=auto_send,
-                        status=decision.status,
-                    )
+                if not llm:
+                    decision = self._classify_dialogue_by_rules(alert, conversation_messages)
+                    if decision.should_stop:
+                        db.update_alert_status_and_reason(
+                            alert_id,
+                            decision.status,
+                            decision.reason,
+                            product_type=decision.product_type,
+                        )
+                        db.update_fishing_session_status(session_id, decision.status, decision.tag, finished=True)
+                        self._log(
+                            f"[fishing] rule decision session={session_id}: "
+                            f"tag={decision.tag}, status={decision.status}, reason={decision.reason}"
+                        )
+                        await agent.close_fishing_browser()
+                        return FishingStartResult(
+                            session_id=session_id,
+                            alert_id=alert_id,
+                            message="",
+                            auto_sent=auto_send,
+                            status=decision.status,
+                        )
                 message, llm_payload = self._build_reply_message(alert, llm, conversation_messages)
             else:
                 self._log(f"[fishing] no existing conversation detected session={session_id}")
@@ -300,6 +309,27 @@ class FishingService:
                 self._log(
                     f"[fishing] LLM decided evidence is collected before send session={session_id}: "
                     f"{llm_payload.get('reason', '')}"
+                )
+                final_status = str(llm_payload.get("status") or "evidence_collected")
+                db.update_alert_status_and_reason(
+                    alert_id,
+                    final_status,
+                    str(llm_payload.get("reason", "")),
+                    product_type=str(llm_payload.get("product_type", "")),
+                )
+                db.update_fishing_session_status(
+                    session_id,
+                    final_status,
+                    str(llm_payload.get("tag", "")) or "llm_stop",
+                    finished=True,
+                )
+                await agent.close_fishing_browser()
+                return FishingStartResult(
+                    session_id=session_id,
+                    alert_id=alert_id,
+                    message="",
+                    auto_sent=auto_send,
+                    status=final_status,
                 )
 
             self._log(f"[fishing] sending next message session={session_id}: {message}")
@@ -315,11 +345,7 @@ class FishingService:
                 "message_sent" if auto_send else "message_filled",
                 "next_message_sent" if auto_send else "next_message_filled",
             )
-            if should_stop:
-                final_status = "evidence_collected"
-                db.update_alert_status(alert_id, "evidence_collected")
-                db.update_fishing_session_status(session_id, "evidence_collected", "final_message_sent")
-            elif auto_send:
+            if auto_send:
                 final_status = await self._run_auto_dialogue(
                     db=db,
                     session_id=session_id,
@@ -428,25 +454,40 @@ class FishingService:
                 db.update_fishing_session_status(session_id, "waiting_seller", "waiting_seller_reply")
                 return "waiting_seller"
 
-            decision = self._classify_dialogue_by_rules(alert, conversation_messages)
-            if decision.should_stop:
-                db.update_alert_status_and_reason(
-                    alert["alert_id"],
-                    decision.status,
-                    decision.reason,
-                    product_type=decision.product_type,
-                )
-                db.update_fishing_session_status(session_id, decision.status, decision.tag, finished=True)
-                self._log(
-                    f"[fishing] rule decision session={session_id}: "
-                    f"tag={decision.tag}, status={decision.status}, reason={decision.reason}"
-                )
-                return decision.status
+            if not llm:
+                decision = self._classify_dialogue_by_rules(alert, conversation_messages)
+                if decision.should_stop:
+                    db.update_alert_status_and_reason(
+                        alert["alert_id"],
+                        decision.status,
+                        decision.reason,
+                        product_type=decision.product_type,
+                    )
+                    db.update_fishing_session_status(session_id, decision.status, decision.tag, finished=True)
+                    self._log(
+                        f"[fishing] rule decision session={session_id}: "
+                        f"tag={decision.tag}, status={decision.status}, reason={decision.reason}"
+                    )
+                    return decision.status
 
             reply, reply_payload = self._build_reply_message(alert, llm, conversation_messages)
             should_stop = bool(reply_payload.get("should_stop")) if isinstance(reply_payload, dict) else False
             if should_stop:
                 self._log(f"[fishing] LLM decided to stop session={session_id}: {reply_payload.get('reason', '')}")
+                final_status = str(reply_payload.get("status") or "evidence_collected")
+                db.update_alert_status_and_reason(
+                    alert["alert_id"],
+                    final_status,
+                    str(reply_payload.get("reason", "")),
+                    product_type=str(reply_payload.get("product_type", "")),
+                )
+                db.update_fishing_session_status(
+                    session_id,
+                    final_status,
+                    str(reply_payload.get("tag", "")) or "llm_stop",
+                    finished=True,
+                )
+                return final_status
             self._log(f"[fishing] sending reply round {round_index} session={session_id}: {reply}")
             if not await agent.send_chat_message(page, reply):
                 db.update_alert_status(alert["alert_id"], "manual_required")
@@ -457,10 +498,6 @@ class FishingService:
             sent_messages.append(reply)
             conversation_messages.append({"sender": "buyer", "content": reply})
             db.save_fishing_message(alert["listing_id"], session_id, "buyer", reply)
-            if should_stop:
-                db.update_alert_status(alert["alert_id"], "evidence_collected")
-                db.update_fishing_session_status(session_id, "evidence_collected", f"final_reply_sent_round_{round_index}")
-                return "evidence_collected"
             db.update_fishing_session_status(session_id, "dialogue_replied", f"reply_sent_round_{round_index}")
             final_status = "dialogue_replied"
 
@@ -469,16 +506,11 @@ class FishingService:
 
     def _normalize_dialogue_messages(self, messages: list[dict]) -> list[dict]:
         result = []
-        seen = set()
         for message in messages:
             sender = str(message.get("sender", "")).strip() or "seller"
             content = str(message.get("content", "")).strip()
             if sender not in {"buyer", "seller"} or not content:
                 continue
-            key = (sender, content)
-            if key in seen:
-                continue
-            seen.add(key)
             result.append({"sender": sender, "content": content})
         return result
 
@@ -501,10 +533,32 @@ class FishingService:
             for message in db.list_fishing_messages_by_listing(listing_id)
             if message.get("sender") in {"buyer", "seller"}
         ]
-        if stored_messages == recognized_messages:
+        merged_messages = self._merge_recognized_history(stored_messages, recognized_messages)
+        if stored_messages == merged_messages:
             return False
-        db.replace_fishing_messages_for_listing(listing_id, session_id, recognized_messages)
+        db.replace_fishing_messages_for_listing(listing_id, session_id, merged_messages)
         return True
+
+    def _merge_recognized_history(self, stored_messages: list[dict], recognized_messages: list[dict]) -> list[dict]:
+        if not stored_messages:
+            return recognized_messages
+        if not recognized_messages:
+            return stored_messages
+        if stored_messages == recognized_messages:
+            return stored_messages
+
+        if len(recognized_messages) >= len(stored_messages):
+            return recognized_messages
+
+        if stored_messages[-len(recognized_messages):] == recognized_messages:
+            return stored_messages
+
+        max_overlap = min(len(stored_messages), len(recognized_messages))
+        for overlap in range(max_overlap, 0, -1):
+            if stored_messages[-overlap:] == recognized_messages[:overlap]:
+                return stored_messages + recognized_messages[overlap:]
+
+        return stored_messages
 
     def _build_reply_message(
         self,
@@ -512,33 +566,41 @@ class FishingService:
         llm: Optional[LLMClient],
         conversation_messages: list[dict],
     ) -> tuple[str, dict]:
-        rule_decision = self._build_follow_up_by_rules(alert, conversation_messages)
-        if rule_decision.message:
-            return (
-                rule_decision.message,
-                {
-                    "source": "local_rule",
-                    "intent": rule_decision.reason,
-                    "should_stop": False,
-                },
-            )
-
         if not llm:
+            rule_decision = self._build_follow_up_by_rules(alert, conversation_messages)
+            if rule_decision.message:
+                return (
+                    rule_decision.message,
+                    {
+                        "source": "local_rule",
+                        "intent": rule_decision.reason,
+                        "should_stop": False,
+                    },
+                )
+
             buyer_turns = sum(1 for message in conversation_messages if message.get("sender") == "buyer")
             if buyer_turns <= 1:
                 return ("这个价格是一年还是两年，需要换号吗", {"source": "fallback", "should_stop": False})
             return ("使用中需要换号吗", {"source": "fallback", "should_stop": False})
 
         prompt = PromptTemplates.FISHING_CHAT.format(
-            listing_price=alert.get("price", ""),
+            listing_price=self._format_price_text(self._alert_price(alert)),
             title=alert.get("title", ""),
             question=self._latest_dialogue_content(conversation_messages, "buyer"),
             seller_reply=self._latest_dialogue_content(conversation_messages, "seller"),
             conversation_history=self._format_conversation_history(conversation_messages),
         )
+        self._log(
+            "[fishing] FISHING_CHAT prompt:\n"
+            f"{prompt}\n"
+            "[fishing] end FISHING_CHAT prompt"
+        )
         payload = llm.chat_json(messages=[{"role": "user", "content": prompt}])
         if not isinstance(payload, dict):
             raise ValueError("Fishing LLM response must be a JSON object.")
+        payload = self._normalize_fishing_chat_payload(payload)
+        if payload.get("should_stop"):
+            return ("", payload)
         message = str(payload.get("follow_up_message", "")).strip()
         tag = str(payload.get("tag", "")).strip()
         if not message and tag == "need_ask_change_account":
@@ -550,6 +612,55 @@ class FishingService:
         message = self._normalize_chat_message_style(message)
         payload["follow_up_message"] = message
         return (message, payload)
+
+    def _normalize_fishing_chat_payload(self, payload: dict) -> dict:
+        result = dict(payload)
+        tag = str(result.get("tag", "")).strip()
+        evidence = result.get("evidence") or []
+        if isinstance(evidence, list):
+            reason = "；".join(str(item) for item in evidence if str(item).strip())
+        else:
+            reason = str(evidence or "")
+        if not reason:
+            reason = str(result.get("reason", "")).strip()
+
+        if tag == "gray_account":
+            result["should_stop"] = True
+            if not result.get("status"):
+                result["status"] = "resolved"
+            if not result.get("product_type"):
+                result["product_type"] = "gray_account"
+            if not result.get("reason"):
+                result["reason"] = reason or "卖家已确认使用过程中需要换账号"
+            result["follow_up_message"] = ""
+        elif tag == "manual_payment_required":
+            result["should_stop"] = True
+            if not result.get("status"):
+                result["status"] = "resolved_unpaid"
+            if not result.get("product_type"):
+                result["product_type"] = "channel_resale"
+            if not result.get("reason"):
+                result["reason"] = reason or "卖家已确认使用中不需要换账号，需要人工付款确认"
+            result["follow_up_message"] = ""
+        elif tag == "need_manual_review":
+            result["should_stop"] = True
+            if not result.get("status"):
+                result["status"] = "manual_required"
+            if not result.get("product_type"):
+                result["product_type"] = "uncertain"
+            if not result.get("reason"):
+                result["reason"] = reason or "对话信息冲突或含糊，需要人工复核"
+            result["follow_up_message"] = ""
+        else:
+            result["should_stop"] = bool(result.get("should_stop", False))
+
+        if (
+            result.get("should_stop")
+            and result.get("product_type") == "channel_resale"
+            and result.get("status") != "resolved_paid"
+        ):
+            result["status"] = "resolved_unpaid"
+        return result
 
     def _build_initial_message_by_rules(self, alert: dict) -> str:
         price = self._alert_price(alert)
@@ -725,7 +836,8 @@ class FishingService:
 
     def _normalize_chat_message_style(self, message: str) -> str:
         value = str(message or "").strip()
-        value = re.sub(r"[？?。.!！]+", "", value)
+        value = re.sub(r"(?<!\d)\.(?!\d)", "", value)
+        value = re.sub(r"[？?。!！]+", "", value)
         value = re.sub(r"[，,、；;]+", "，", value)
         return value.strip(" ，,、；;")
 
@@ -789,9 +901,22 @@ class FishingService:
         value = re.sub(r"\s+", "", str(text or "").lower())
         return any(pattern in value for pattern in ("年卡", "一年", "1年", "两年", "二年", "2年", "长期"))
 
+    def _is_account_change_question(self, text: str) -> bool:
+        value = re.sub(r"\s+", "", str(text or "").lower())
+        has_change_topic = any(pattern in value for pattern in ("换号", "换账号", "换帐号", "更换账号", "更换帐号"))
+        has_question_marker = any(marker in value for marker in ("吗", "么", "?", "？"))
+        return has_change_topic and has_question_marker
+
     def _account_change_state(self, text: str) -> str:
         value = re.sub(r"\s+", "", str(text or "").lower())
+        if self._is_account_change_question(text):
+            return "unknown"
+
         no_change_patterns = (
+            "不需要",
+            "不用",
+            "无需",
+            "不换",
             "不用换号",
             "不用换账号",
             "不需要换号",

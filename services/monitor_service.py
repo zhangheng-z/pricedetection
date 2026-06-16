@@ -206,6 +206,7 @@ class MonitorService:
         if not settings.llm.api_key:
             raise ValueError("LLM API key not configured.")
 
+        LLMClient.configure_usage_storage(db_path)
         db = Database(db_path)
         alerts = db.list_review_alerts()
         if not alerts:
@@ -388,6 +389,7 @@ class MonitorService:
         settings: Settings = config["settings"]
         products: List[ProductConfig] = config["products"]
         accounts: List[AccountConfig] = config["accounts"]
+        LLMClient.configure_usage_storage(options.db_path)
 
         if options.platform != "all" and options.platform not in AGENTS_MAP:
             raise ValueError(f"Unsupported platform: {options.platform}")

@@ -1126,6 +1126,40 @@ class XianyuAgent(BaseAgent):
                         className: className.slice(0, 120),
                     };
                 };
+                const makeStructuredItem = (row, rowIndex) => {
+                    const textEl = row.querySelector(
+                        '[class*="message-text-left"], [class*="message-text-right"], [class*="message-text"]'
+                    );
+                    if (!textEl) return null;
+                    const text = clean(textEl.innerText || textEl.textContent);
+                    if (isNoise(text)) return null;
+
+                    const rect = textEl.getBoundingClientRect();
+                    const rowStyle = window.getComputedStyle(row);
+                    const rowClassName = String(row.className || '');
+                    const textClassName = String(textEl.className || '');
+                    const isRight = /message-text-right/i.test(textClassName) ||
+                        rowStyle.direction === 'rtl' ||
+                        /text-align:\s*right/i.test(row.getAttribute('style') || '');
+                    const anchor = row.closest('[data-before-current-y]') || row.closest('div[style*="position"]');
+                    const virtualY = Number.parseFloat(anchor?.getAttribute('data-before-current-y') || '');
+                    return {
+                        sender: isRight ? 'buyer' : 'seller',
+                        content: text,
+                        score: 1000,
+                        source: 'structured',
+                        order: rowIndex,
+                        virtualY: Number.isFinite(virtualY) ? virtualY : null,
+                        key: `structured|${rowIndex}|${isRight ? 'buyer' : 'seller'}|${text}`,
+                        rect: {
+                            x: rect.x,
+                            y: rect.y,
+                            width: rect.width,
+                            height: rect.height
+                        },
+                        className: `${rowClassName} ${textClassName}`.slice(0, 120),
+                    };
+                };
                 const validItem = (item) =>
                     item.content &&
                     item.rect.y > 40 &&
@@ -1134,6 +1168,13 @@ class XianyuAgent(BaseAgent):
                     item.rect.width <= window.innerWidth * 0.65 &&
                     item.content.length <= 260 &&
                     !isNoise(item.content);
+
+                const structuredItems = Array.from(document.querySelectorAll('li.ant-list-item'))
+                    .map((row, index) => makeStructuredItem(row, index))
+                    .filter((item) => item && item.content);
+                if (structuredItems.length) {
+                    return {source: 'structured', messages: structuredItems};
+                }
 
                 const messageRows = Array.from(document.querySelectorAll(
                     '[class*="message-row"], [class*="MessageRow"], [class*="msg-row"], [class*="bubble"]'
@@ -1158,33 +1199,44 @@ class XianyuAgent(BaseAgent):
                 const candidates = [...rowItems, ...globalItems, ...rightTextItems];
 
                 const seen = new Set();
-                return candidates
+                const fallbackItems = candidates
                     .sort((a, b) => (a.rect.y - b.rect.y) || (a.rect.x - b.rect.x) || (b.score - a.score))
                     .filter((item) => {
                         const key = `${item.content}|${Math.round(item.rect.y / 6)}`;
                         if (seen.has(key)) return false;
                         seen.add(key);
                         return true;
-                    })
-                    .slice(-20);
+                    });
+                return {source: 'fallback', messages: fallbackItems};
             }
         """
         all_messages = []
         diagnostics = []
-        scan_rounds = 8 if scroll_to_top else 1
+        structured_messages = None
+        scan_rounds = 1
         for scan_index in range(scan_rounds):
             for index, context in enumerate([page, *page.frames]):
                 try:
-                    messages = await context.evaluate(script)
+                    payload = await context.evaluate(script)
+                    source = payload.get("source", "") if isinstance(payload, dict) else ""
+                    messages = payload.get("messages", []) if isinstance(payload, dict) else (payload or [])
+                    current_structured_messages = []
                     for message in messages or []:
                         item = dict(message)
                         item["frame"] = index
                         item["scan"] = scan_index
-                        all_messages.append(item)
+                        if source == "structured":
+                            current_structured_messages.append(item)
+                        else:
+                            all_messages.append(item)
+                    if source == "structured" and current_structured_messages:
+                        if structured_messages is None or len(current_structured_messages) > len(structured_messages):
+                            structured_messages = current_structured_messages
                     diagnostics.append({
                         "scan": scan_index,
                         "frame": index,
                         "url": getattr(context, "url", ""),
+                        "source": source,
                         "messages": messages or [],
                     })
                 except Exception as exc:
@@ -1241,21 +1293,36 @@ class XianyuAgent(BaseAgent):
         if save_diagnostics:
             await self._save_fishing_message_diagnostics(diagnostics)
 
+        if structured_messages is not None:
+            all_messages = structured_messages
+
         seen = set()
         result = []
         for message in sorted(
             all_messages,
-            key=lambda item: (item.get("scan", 0), item.get("frame", 0), item.get("rect", {}).get("y", 0)),
+            key=lambda item: (
+                item.get("frame", 0),
+                0 if item.get("source") == "structured" else 1,
+                item.get("order", item.get("scan", 0)),
+                item.get("rect", {}).get("y", 0),
+            ),
         ):
             content = str(message.get("content", "")).strip()
             if not content:
                 continue
-            key = (message.get("sender", ""), content)
+            key = message.get("key")
+            if not key:
+                rect = message.get("rect", {})
+                key = (
+                    message.get("sender", ""),
+                    content,
+                    message.get("frame", 0),
+                    int(float(rect.get("y", 0)) // 8),
+                )
             if key in seen:
                 continue
             seen.add(key)
             result.append({"sender": message.get("sender", ""), "content": content})
-        result = result[-80:]
         if verbose:
             print(f"[{self.PLATFORM}] fishing recognized chat messages: {len(result)}", flush=True)
             for index, message in enumerate(result, 1):

@@ -509,7 +509,7 @@ class MainWindow(QMainWindow):
         runtime_layout.addWidget(self.products_label)
         runtime_layout.addWidget(QLabel("账号", runtime_group))
         runtime_layout.addWidget(self.accounts_label)
-        runtime_layout.addWidget(QLabel("Token", runtime_group))
+        runtime_layout.addWidget(QLabel("Token 总计", runtime_group))
         runtime_layout.addWidget(self.token_usage_label)
         layout.addWidget(runtime_group)
 
